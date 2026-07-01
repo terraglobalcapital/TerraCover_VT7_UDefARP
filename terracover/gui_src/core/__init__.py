@@ -1,0 +1,1 @@
+# Core components for PyQt6 GUI framework

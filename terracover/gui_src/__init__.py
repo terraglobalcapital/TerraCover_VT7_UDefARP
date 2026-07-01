@@ -1,0 +1,1 @@
+# PyQt6 GUI Framework for TerraCove

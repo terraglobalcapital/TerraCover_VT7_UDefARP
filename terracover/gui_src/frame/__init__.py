@@ -1,0 +1,1 @@
+# Frame components for PyQt6 GUI framework
