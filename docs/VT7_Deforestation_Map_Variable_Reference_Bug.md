@@ -183,7 +183,7 @@ deforestation_arr[(arr_def_cnf == 0) & (arr_def_cal == 0) & (fmask == 1)] = 1
 deforestation_arr[(arr_def_cnf == 0) & (arr_def_cal == 0) & (arr_fmask == 1)] = 1
 ```
 
-**File:** `terracover/modules/vt7/standalone/vt7_udef_arp/terracover/modules/vt7/evaluation.py`
+**File:** `terracover/modules/vt7/evaluation.py`
 **Line:** 557
 
 ```python

@@ -71,7 +71,6 @@ With `tolerance = 1.00001`, convergence now requires `0.99999 <= AR <= 1.00001`.
 ### Files Modified
 
 - `terracover/modules/vt7/adjustment.py`
-- `terracover/modules/vt7/standalone/vt7_udef_arp/terracover/modules/vt7/adjustment.py`
 
 ---
 
@@ -140,7 +139,6 @@ This guarantees the rescaling reflects the real value range of the input, is nev
 ### Files Modified
 
 - `terracover/modules/vt7/geometric_classification.py`
-- `terracover/modules/vt7/standalone/vt7_udef_arp/terracover/modules/vt7/geometric_classification.py`
 
 ---
 
