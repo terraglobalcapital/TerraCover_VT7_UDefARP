@@ -10,6 +10,26 @@ This tool implements the VT0007 methodology for:
 - Alternative Model evaluation
 - Deforestation map generation with uncertainty assessment
 
+## Corrections & Documentation
+
+This standalone tool is a **corrected and enhanced** implementation of the Verra UDef-ARP reference code. It fixes several bugs present in the original Verra implementation (and, where noted, in the newer **UDef-ARP v2.11** release) and improves the methodology in line with the VT0007 specification.
+
+Detailed technical documentation for every bug fix and enhancement — including code comparisons, mathematical proofs, and a per-bug evaluation of whether Verra's v2.11 resolves each issue — is in the [`docs/`](docs) folder (Markdown sources, with Word copies under [`docs/word version/`](docs/word%20version)):
+
+| Document | Topic |
+|----------|-------|
+| `VT7_UDef-ARP_Version_Comparison_2.11_vs_Original.md` | Full comparison: Original vs v2.11 vs TerraCover |
+| `VT7_Geometric_Distribution_Analysis.md` | Geometric classification off-by-one + alternative-model formula |
+| `VT7_AR_Adjustment_Bug_Fixes.md` | Bidirectional AR adjustment + ETP metadata rescaling |
+| `VT7_Adjustment_Ratio_Implementation_Analysis.md` | Accumulative AR iteration (VT0007 compliance) |
+| `VT7_Deforestation_Map_Variable_Reference_Bug.md` | `fmask` variable-reference bug |
+| `VT7_Missing_Vulnerability_Zones_Bug_Fix.md` | NaN propagation from missing vulnerability zones |
+| `VT7_Frequency_table_changes.md` | NoData handling + Int16 overflow in frequency tables |
+| `VT7_Evaluation_Improvements.md` | Dual-mask Thiessen evaluation + scatter-plot enhancements |
+| `VT7_Spatial_Deforestation_Allocation.md` | Spatial deforestation allocation |
+
+Code paths cited in these documents are relative to this repository root (e.g. `terracover/modules/vt7/adjustment.py`). References to `verra_code/UDef-ARP-main` and `UDef-ARP-main 2.11` denote Verra's public UDef-ARP reference code used for comparison and are not shipped with this tool.
+
 ## Requirements
 
 - Windows 10/11 (64-bit)
@@ -68,6 +88,9 @@ python run_vt7.py
 vt7_udef_arp/
 ├── run_vt7.py              # Entry point
 ├── README.md               # This file
+├── docs/                   # Bug-fix & methodology documentation
+│   ├── *.md                            # Markdown sources
+│   └── word version/                   # Word (.docx) copies
 ├── installation/           # Installation files
 │   ├── install_udef_arp.bat           # Automated installer
 │   ├── requirements.txt               # Python dependencies
