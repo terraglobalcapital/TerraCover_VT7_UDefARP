@@ -30,8 +30,9 @@ Detailed technical documentation for every bug fix and enhancement — including
 | `VT7_Evaluation_Statistics_and_Normalisation.md` | Residuals normalised to the nominal grid area; MAE / IoU / Agreement / Difference; interactive plot |
 | `VT7_Vulnerability_Zoning_KMeans.md` | k-means zoning for alternative models, and why geometric intervals empty the extreme classes |
 | `VT7_Absent_Vulnerability_Zones_Interpolation.md` | Absent zones take an interpolated frequency instead of 0 |
+| `VT7_Evaluacion_Comparacion_2.11_vs_TerraCover.md` | Evaluation process: UDef-ARP 2.11 vs this package (Spanish) |
 
-Code paths cited in these documents are relative to this repository root (e.g. `terracover/modules/vt7/adjustment.py`). References to `verra_code/UDef-ARP-main` and `UDef-ARP-main 2.11` denote Verra's public UDef-ARP reference code used for comparison and are not shipped with this tool.
+Code paths cited in these documents are relative to this repository root (e.g. `terracover/modules/vt7/adjustment.py`). References to `verra_code/UDef-ARP-main` and `UDef-ARP-main 2.11` denote Verra's public UDef-ARP reference code used for comparison and are not shipped with this tool. Which releases those are, and the SHA-256 of every file in them, is recorded in [`VERRA_REFERENCE_CODE.md`](VERRA_REFERENCE_CODE.md).
 
 ## Requirements
 

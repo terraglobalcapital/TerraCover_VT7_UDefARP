@@ -15,3 +15,10 @@ Thumbs.db
 
 # Word lock files, left behind when a document is open or Word crashed
 ~$*
+
+# Verra's UDef-ARP reference releases, kept beside this package for the comparison work.
+# Third-party code with its own provenance, and deliberately NOT published from here: the
+# README states that it is not shipped with this tool. VERRA_REFERENCE_CODE.md records which
+# releases these are and the SHA-256 of every file, so a comparison stays checkable without
+# redistributing them.
+/verra_code/
