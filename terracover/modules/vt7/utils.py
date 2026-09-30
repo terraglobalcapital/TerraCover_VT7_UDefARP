@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 # ------------------------------------------------------------------------
 #
 #   Copyright:          © Terra Global Capital. All rights reserved.
@@ -26,14 +26,61 @@ Includes functions for:
 
 import os
 import numpy as np
-from osgeo import gdal, ogr
+from osgeo import gdal, ogr, osr
 import tempfile
 import shutil
 import re
 
+try:
+    from ...core.expression_guard import safe_eval
+except ImportError:
+    from terracover.core.expression_guard import safe_eval
+
 # Enable GDAL/OGR exceptions for better error handling
 gdal.UseExceptions()
 ogr.UseExceptions()
+
+
+def pixel_size_meters(in_ds, context=""):
+    """Return the raster's pixel size as a float in metres, checking the CRS is projected.
+
+    vt7 measures everything in metres -- the NRT, the geometric class boundaries, the validation
+    grid -- so a non-projected raster (degrees) would make all of that meaningless. It used to read
+    the size as int(GetGeoTransform()[1]) at three points:
+      - int() truncates the resolution. It is a no-op for the usual 30 m / 10 m UTM inputs
+        (int(30.0) == 30), but a resampled raster at 29.97 m became 29, shifting the histogram bins
+        and so the NRT, and the geometric ratio, and ~0.7% of the vulnerability-class assignment.
+      - it silently masked the far worse case: a raster in degrees has a pixel of ~0.00027, and
+        int() of that is 0 -- LL/UL collapses and the whole classification is nonsense. Nothing
+        checked the CRS, so that produced numbers rather than an error.
+
+    Reading the true float fixes the first; requiring a projected CRS closes the second.
+
+    Args:
+        in_ds: an open GDAL dataset.
+        context: short label for the error message (e.g. "geometric classification").
+
+    Returns:
+        float: the pixel width in the raster's (projected) units, i.e. metres.
+
+    Raises:
+        ValueError: if the raster has no CRS, or a geographic (degrees) one.
+    """
+    wkt = in_ds.GetProjection()
+    if not wkt:
+        raise ValueError(
+            f"{context or 'vt7'}: the input raster has no coordinate reference system. vt7 works "
+            f"in metres (NRT, class boundaries, sampling grid), so a projected CRS is required."
+        )
+    srs = osr.SpatialReference()
+    srs.ImportFromWkt(wkt)
+    if srs.IsGeographic() or not srs.IsProjected():
+        raise ValueError(
+            f"{context or 'vt7'}: the input raster is in a geographic CRS (degrees). vt7 measures "
+            f"the NRT and class boundaries in metres, so the raster must be in a projected CRS "
+            f"(e.g. UTM). Reproject it first."
+        )
+    return abs(float(in_ds.GetGeoTransform()[1]))
 
 
 def image_to_array(image):
@@ -223,7 +270,7 @@ def vector_to_raster(vector_fn, in_fn, raster_fn, data_type, attribute, nodata=N
     return
 
 
-def admin_divisions_to_raster(shapefile_fn, in_fn, raster_fn, data_type=gdal.GDT_UInt16, id_field='ID', mask_file=None, nodata=None, compress='lzw'):
+def admin_divisions_to_raster(shapefile_fn, in_fn, raster_fn, data_type=gdal.GDT_UInt16, id_field='ID', mask_file=None, nodata=None, compress='lzw', layer_name=None):
     '''
     Convert shapefile to raster with consecutive integer IDs starting from 2
     :param shapefile_fn: input shapefile path
@@ -234,11 +281,17 @@ def admin_divisions_to_raster(shapefile_fn, in_fn, raster_fn, data_type=gdal.GDT
     :param mask_file: optional mask raster - keeps values inside mask, sets outside to nodata, fills nodata inside mask with 1
     :param nodata: optional NoData value
     :param compress: compression method for GeoTIFF ('lzw', 'deflate', 'packbits', 'none'). Default: 'lzw'
+    :param layer_name: which layer of a multi-layer container (.gpkg/.gdb) to read; None keeps
+        the first layer, the historical behaviour
     :return:
     '''
     # Open the original shapefile (read-only)
     source_ds = ogr.Open(shapefile_fn, 0)
-    source_layer = source_ds.GetLayer()
+    source_layer = source_ds.GetLayerByName(layer_name) if layer_name else source_ds.GetLayer()
+    if source_layer is None:
+        available = [source_ds.GetLayer(i).GetName() for i in range(source_ds.GetLayerCount())]
+        raise ValueError(f"Layer {layer_name!r} not found in {shapefile_fn}. "
+                         f"Available: {', '.join(available)}")
 
     # Create a temporary in-memory shapefile with only the ID field
     mem_driver = ogr.GetDriverByName('Memory')
@@ -456,9 +509,10 @@ def raster_calculator(input_files, output_file, expression, out_dtype="uint8"):
         array.append(bands)
         ds = None
 
-    # Evaluate expression
+    # Evaluate expression. Guarded by an AST allow-list: eval runs any Python, and expressions can
+    # arrive from a saved argument JSON rather than the keyboard.
     with np.errstate(divide='ignore', invalid='ignore'):
-        result = eval(numpy_expr)
+        result = safe_eval(numpy_expr, array=array, np=np)
 
     # Handle inf values
     if isinstance(result, np.ndarray):
@@ -598,6 +652,7 @@ def read_nrt_value(nrt_txt_file):
 
         The NRT is defined as the distance from forest edge at which
         99.5 percent of the deforestation experienced over the HRP has occurred.
+        (an FCBM-DG run writes "degradation" here; only "NRT value:" is parsed)
 
         NRT value: 450 meters
         NRT bin range: 420.00 - 480.00 meters

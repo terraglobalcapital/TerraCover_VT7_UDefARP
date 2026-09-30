@@ -27,6 +27,9 @@ Detailed technical documentation for every bug fix and enhancement — including
 | `VT7_Frequency_table_changes.md` | NoData handling + Int16 overflow in frequency tables |
 | `VT7_Evaluation_Improvements.md` | Dual-mask Thiessen evaluation + scatter-plot enhancements |
 | `VT7_Spatial_Deforestation_Allocation.md` | Spatial deforestation allocation |
+| `VT7_Evaluation_Statistics_and_Normalisation.md` | Residuals normalised to the nominal grid area; MAE / IoU / Agreement / Difference; interactive plot |
+| `VT7_Vulnerability_Zoning_KMeans.md` | k-means zoning for alternative models, and why geometric intervals empty the extreme classes |
+| `VT7_Absent_Vulnerability_Zones_Interpolation.md` | Absent zones take an interpolated frequency instead of 0 |
 
 Code paths cited in these documents are relative to this repository root (e.g. `terracover/modules/vt7/adjustment.py`). References to `verra_code/UDef-ARP-main` and `UDef-ARP-main 2.11` denote Verra's public UDef-ARP reference code used for comparison and are not shipped with this tool.
 

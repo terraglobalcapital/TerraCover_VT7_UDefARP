@@ -16,6 +16,12 @@ seaborn>=0.12.0
 # Scientific computing
 scipy>=1.10.0
 
+# Vulnerability zoning for alternative models (k-means classification)
+scikit-learn>=1.3.0
+
+# Interactive evaluation plot (optional: the static PNG is always written)
+plotly>=5.18.0
+
 # Excel support
 openpyxl>=3.1.0
 

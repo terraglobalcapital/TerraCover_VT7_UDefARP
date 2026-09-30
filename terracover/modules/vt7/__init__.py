@@ -16,7 +16,8 @@
 VT7 (Vulnerability Mapping Tool 7) Package
 
 This package provides a complete implementation of the VT7 methodology for
-forest vulnerability mapping and deforestation risk assessment.
+forest vulnerability mapping and deforestation risk assessment. The same
+procedure serves the degradation benchmark (FCBM-DG); see `terminology`.
 
 Modules:
 --------
@@ -27,6 +28,7 @@ Modules:
 - adjustment: Adjustment ratio calculations and iterative adjustments
 - evaluation: Model evaluation and performance analysis
 - workflow: Main workflow orchestration functions
+- terminology: the deforestation/degradation output vocabulary (labels only)
 
 Main Classes:
 -------------
@@ -53,6 +55,7 @@ results = udef_arp(
     admin_divisions="path/to/admin.shp",
     area_of_interest="path/to/aoi_binary_mask.tif",  # Binary mask: 1=analysis area, 0=outside
     expected_deforestation=29376,
+    benchmark_type="deforestation",   # or "degradation" for an FCBM-DG input
     workflow_stages=["BCM Calibration (CAL)", "BCM Confirmation (CNF)",
                      "BCM Evaluation CAL", "BCM Evaluation CNF"]
 )
@@ -83,7 +86,7 @@ try:
     from .geometric_classification import (
         nrt_calculation,
         geometric_classification,
-        geometric_classification_alternative
+        kmeans_classification_alternative
     )
 
     # Import frequency analysis
@@ -113,6 +116,15 @@ try:
         run_application_stage
     )
 
+    # Import the output vocabulary (deforestation vs degradation)
+    from .terminology import (
+        BENCHMARK_DF,
+        BENCHMARK_DG,
+        BENCHMARK_TYPES,
+        normalize_benchmark_type,
+        terms
+    )
+
 except ImportError:
     # Fallback to absolute imports
     sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -134,7 +146,7 @@ except ImportError:
     from terracover.modules.vt7.geometric_classification import (
         nrt_calculation,
         geometric_classification,
-        geometric_classification_alternative
+        kmeans_classification_alternative
     )
 
     from terracover.modules.vt7.frequency_analysis import (
@@ -160,6 +172,14 @@ except ImportError:
         run_application_stage
     )
 
+    from terracover.modules.vt7.terminology import (
+        BENCHMARK_DF,
+        BENCHMARK_DG,
+        BENCHMARK_TYPES,
+        normalize_benchmark_type,
+        terms
+    )
+
 # Define public API
 __all__ = [
     # Utilities
@@ -183,7 +203,7 @@ __all__ = [
     # Geometric classification
     'nrt_calculation',
     'geometric_classification',
-    'geometric_classification_alternative',
+    'kmeans_classification_alternative',
 
     # Frequency analysis
     'tabulation_bin_id',
@@ -194,7 +214,14 @@ __all__ = [
     # Adjustment
     'calculate_adjustment_ratio_cnf',
     'adjusted_prediction_density_array',
-    'iterative_ar_adjustment'
+    'iterative_ar_adjustment',
+
+    # Output vocabulary
+    'BENCHMARK_DF',
+    'BENCHMARK_DG',
+    'BENCHMARK_TYPES',
+    'normalize_benchmark_type',
+    'terms'
 ]
 
 __version__ = '1.0.0'

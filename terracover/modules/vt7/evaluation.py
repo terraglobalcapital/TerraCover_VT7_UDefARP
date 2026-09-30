@@ -19,7 +19,18 @@ This module contains the ModelEvaluation class and evaluation methods for VT7 mo
 Includes:
 - ModelEvaluation class for analyzing model performance
 - Voronoi-based sampling and evaluation
-- Statistical analysis and visualization
+- Statistical analysis and visualization (PNG, an interactive HTML plot, and a statistics file)
+
+Two things about the statistics are worth knowing before reading them:
+
+- The assessment cells are left unequal in area by the exclusion mask, so observed and predicted
+  are normalised to the nominal grid area before any PER-CELL statistic is computed. Without that,
+  a cell trimmed to three quarters of full size holds proportionally less of everything, its
+  residual included, and pulls a median taken across cells. MedAE and MAE are therefore on the
+  normalised values; both are also reported raw, for traceability.
+- The AGGREGATE statistics — Agreement, Difference and IoU — are computed on the raw hectares.
+  They sum over all cells rather than comparing them, so they keep a physical reading, and
+  normalising them would overweight the cells the exclusions trimmed.
 """
 
 import os
@@ -27,18 +38,27 @@ import sys
 import numpy as np
 from osgeo import gdal, ogr, osr
 from osgeo.gdalconst import GA_ReadOnly
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import pandas as pd
 import scipy.stats as stats
 from scipy.spatial import Voronoi
 import geopandas as gpd
 import shapely
-import seaborn as sns
 from shapely.geometry import Point
 from geopandas import GeoDataFrame
 import shutil
+
+# matplotlib.pyplot and seaborn are imported by _plotting_backend() inside the
+# two functions that draw. Importing them here pulled matplotlib (and, through
+# pyplot, IPython) into every launcher tab that touches the VT7 package.
+
+
+def _plotting_backend():
+    """Import pyplot behind the headless Agg backend and return (plt, seaborn)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    return plt, sns
 
 # Enable GDAL/OGR exceptions for better error handling
 gdal.UseExceptions()
@@ -46,10 +66,12 @@ ogr.UseExceptions()
 osr.UseExceptions()
 
 try:
-    from .utils import image_to_array, array_to_image, replace_ref_system, vector_to_raster
+    from .utils import image_to_array, array_to_image, replace_ref_system, vector_to_raster, pixel_size_meters
+    from .terminology import BENCHMARK_DF, terms, evaluation_columns, residual_fields
 except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
-    from terracover.modules.vt7.utils import image_to_array, array_to_image, replace_ref_system, vector_to_raster
+    from terracover.modules.vt7.utils import image_to_array, array_to_image, replace_ref_system, vector_to_raster, pixel_size_meters
+    from terracover.modules.vt7.terminology import BENCHMARK_DF, terms, evaluation_columns, residual_fields
 
 
 class ModelEvaluation:
@@ -71,11 +93,13 @@ class ModelEvaluation:
         self.data_folder = directory
         os.chdir(self.data_folder)
 
-    def replace_legend(self, out_fn):
+    def replace_legend(self, out_fn, benchmark_type=BENCHMARK_DF):
         '''
-         RST raster format: correct legend in rdc file of Combined Deforestation Review Map
+         RST raster format: correct legend in rdc file of Combined Change Review Map
          :param out_fn: rst raster file
+         :param benchmark_type: "deforestation" (default) or "degradation" — legend wording only
         '''
+        _t = terms(benchmark_type)
         if out_fn.split('.')[-1] == 'rst':
             base_name, _ = os.path.splitext(out_fn)
             temp_file_path = 'rdc_temp.rdc'
@@ -86,8 +110,8 @@ class ModelEvaluation:
                         write_file.write("legend cats : " + '3'+'\n')
                         # Write the three new lines
                         write_file.write("code 1      : "+"Forest at the start of HRP"+"\n")
-                        write_file.write("code 2      : "+"Deforestation within CAL"+"\n")
-                        write_file.write("code 3      : "+"Deforestation within CNF"+"\n")
+                        write_file.write("code 2      : "+f"{_t.noun} within CAL"+"\n")
+                        write_file.write("code 3      : "+f"{_t.noun} within CNF"+"\n")
                     else:
                         write_file.write(line)
             shutil.move(temp_file_path, base_name + '.rdc')
@@ -150,9 +174,21 @@ class ModelEvaluation:
         # Read native nodata from raster before any override
         native_nodata = rb.GetNoDataValue()
 
-        if nodata_value:
+        # `is not None`, not truthiness: 0 is a perfectly normal NoData value and both callers pass
+        # exactly that. It is harmless today (the masking below already tests `is not None`, and the
+        # only statistic is a sum, which ignoring zeros cannot change), but the moment a mean or a
+        # count is added to feature_stats, treating 0 as unset would silently skew it.
+        #
+        # Deliberately NOT rb.SetNoDataValue(nodata_value): the raster is opened GA_ReadOnly, but GDAL
+        # still persists a band NoData set this way into a <raster>.aux.xml PAM sidecar, and that
+        # sidecar then OVERRIDES the NoData baked into the GeoTIFF for every later reader. The density
+        # maps are written with NoData -9999 and came back out declaring 0 with -9999 left in the
+        # pixels as ordinary data, which wrecked the colour ramp of every map drawn from them. Reading
+        # statistics must not mutate its input. Nothing here needs the call either: the masking below
+        # compares src_array against nodata_value and native_nodata in numpy, and ReadAsArray returns
+        # the raw values whatever the band declares.
+        if nodata_value is not None:
             nodata_value = float(nodata_value)
-            rb.SetNoDataValue(nodata_value)
 
         vds = ogr.Open(vector_path, GA_ReadOnly)  # TODO maybe open update if we want to write stats
         assert (vds)
@@ -271,7 +307,8 @@ class ModelEvaluation:
 
         return thiessen_gdf
 
-    def create_thiessen_polygon(self, grid_area, mask_voronoi, mask_exclusions, density, deforestation, out_fn, raster_fn):
+    def create_thiessen_polygon(self, grid_area, mask_voronoi, mask_exclusions, density, deforestation, out_fn, raster_fn,
+                                benchmark_type=BENCHMARK_DF):
         '''
           Create thiessen polygon with improved methodology for handling exclusions.
 
@@ -290,12 +327,20 @@ class ModelEvaluation:
          :param mask_voronoi: Full jurisdictional mask for Voronoi generation (no exclusions)
          :param mask_exclusions: Jurisdictional mask with exclusions for final statistics
          :param density: adjusted prediction density map
-         :param deforestation: Deforestation Map during the HRP
+         :param deforestation: observed change map during the HRP (degradation on an FCBM-DG run)
          :param out_fn: Output filename for thiessen polygons
          :param raster_fn: Output filename for residuals raster
+         :param benchmark_type: "deforestation" (default) or "degradation" — picks the column and
+                                shapefile field vocabulary; every statistic is computed identically
          :return  clipped_gdf: thiessen polygon dataframe
         '''
         import tempfile
+
+        plt, _sns = _plotting_backend()
+
+        _t = terms(benchmark_type)
+        actual_col, predicted_col = evaluation_columns(benchmark_type)
+        actual_field, predicted_field = residual_fields(benchmark_type)
 
         print("=" * 60)
         print("Creating Thiessen Polygon Grid")
@@ -314,14 +359,16 @@ class ModelEvaluation:
 
         # Get raster dimensions and geotransform for grid calculations
         in_ds = gdal.Open(mask_voronoi)
-        pixel_size = int(in_ds.GetGeoTransform()[1])
+        # True pixel size in metres (not int()), and reject a degrees CRS.
+        pixel_size = pixel_size_meters(in_ds, "evaluation (sampling grid)")
         raster_y_size = in_ds.RasterYSize
         raster_x_size = in_ds.RasterXSize
         geotransform = in_ds.GetGeoTransform()
         in_ds = None  # Close the dataset to release file handle
 
-        # Calculate grid size from grid area
-        grid_size = int(np.sqrt(grid_area * 10000)) // pixel_size
+        # Calculate grid size from grid area. Outer int() because grid_size indexes range() below;
+        # the division uses the float pixel size so a 29.97 m raster is not rounded up to a 29 m grid.
+        grid_size = int(int(np.sqrt(grid_area * 10000)) // pixel_size)
         print(f"Grid cell size: {grid_size} pixels")
 
         # Systematic Sampling
@@ -433,7 +480,7 @@ class ModelEvaluation:
             ## Convert clipped_gdf to shapefile (geometry only, avoids column name truncation warnings)
             clipped_gdf[['geometry']].to_file(vector_temp_path)
 
-            # Actual Deforestation(ha)
+            # Actual <noun>(ha)
             stats = self.zonal_stats(vector_temp_path, deforestation, nodata_value=0)
 
             # Calculate areal_resolution_of_map_pixels
@@ -444,12 +491,12 @@ class ModelEvaluation:
             in_ds4 = None  # Close dataset to release file handle
 
             # Add the results back to the GeoDataFrame
-            clipped_gdf['Actual Deforestation(ha)'] = [(item['sum'] if item['sum'] is not None else 0) * areal_resolution_of_map_pixels for item in stats]
+            clipped_gdf[actual_col] = [(item['sum'] if item['sum'] is not None else 0) * areal_resolution_of_map_pixels for item in stats]
 
-            # Predicted Deforestation(ha)
+            # Predicted <noun>(ha)
             stats1 = self.zonal_stats(vector_temp_path, density, nodata_value=0)
 
-            clipped_gdf['Predicted Deforestation(ha)'] = [(item['sum'] if item['sum'] is not None else 0) for item in stats1]
+            clipped_gdf[predicted_col] = [(item['sum'] if item['sum'] is not None else 0) for item in stats1]
 
         finally:
             # Clean up temp shapefile and associated files
@@ -466,19 +513,19 @@ class ModelEvaluation:
         clipped_gdf['ID'] = range(1, len(clipped_gdf) + 1)
 
         # Replace NaN or blank values with '0'
-        columns_to_fill = ['Actual Deforestation(ha)', 'Predicted Deforestation(ha)']
+        columns_to_fill = [actual_col, predicted_col]
         for column in columns_to_fill:
             clipped_gdf[column] = clipped_gdf[column].fillna(0)
 
         # Calculate residuals
-        clipped_gdf['Residuals(ha)'] = clipped_gdf['Predicted Deforestation(ha)'] - clipped_gdf['Actual Deforestation(ha)']
+        clipped_gdf['Residuals(ha)'] = clipped_gdf[predicted_col] - clipped_gdf[actual_col]
 
         # Export to Excel with formatting (use os.path.splitext to properly handle file extensions)
         excel_file_path = os.path.splitext(out_fn)[0] + '.xlsx'
         print(f"Saving grid statistics Excel: {os.path.basename(excel_file_path)}")
 
         # Prepare data for export
-        export_df = clipped_gdf.drop('geometry', axis=1)[['ID', 'Actual Deforestation(ha)', 'Predicted Deforestation(ha)', 'Residuals(ha)']]
+        export_df = clipped_gdf.drop('geometry', axis=1)[['ID', actual_col, predicted_col, 'Residuals(ha)']]
 
         # Create Excel writer with openpyxl engine for formatting
         with pd.ExcelWriter(excel_file_path, engine='openpyxl') as writer:
@@ -502,9 +549,31 @@ class ModelEvaluation:
             worksheet.column_dimensions['C'].width = 25
             worksheet.column_dimensions['D'].width = 20
 
+            # Embed provenance: a 'Parameters' sheet with the run arguments.
+            try:
+                from terracover.core.provenance import write_parameters_sheet
+                _wb = writer.book
+                if not any(s in _wb.sheetnames for s in ("Parameters", "Arguments")):
+                    _params = [("module", "VT7 Model Evaluation")] + [
+                        (k, v) for k, v in {
+                            "benchmark_type": _t.benchmark_type,
+                            "grid_area": grid_area,
+                            "mask_voronoi": str(mask_voronoi),
+                            "mask_exclusions": str(mask_exclusions),
+                            "density": str(density),
+                            "deforestation": str(deforestation),
+                            "out_fn": str(out_fn),
+                            "raster_fn": str(raster_fn),
+                            "excel_file_path": str(excel_file_path),
+                        }.items()
+                    ]
+                    write_parameters_sheet(_wb, _params)
+            except Exception:
+                pass
+
         # Rename columns (both for shapefile export and return value)
-        clipped_gdf = clipped_gdf.rename(columns={'Predicted Deforestation(ha)': 'PredDef',
-                                                   'Actual Deforestation(ha)': 'ActualDef',
+        clipped_gdf = clipped_gdf.rename(columns={predicted_col: predicted_field,
+                                                   actual_col: actual_field,
                                                    'Residuals(ha)':'Residuals'})
 
         # Export residuals shapefile with same information as Excel
@@ -514,7 +583,7 @@ class ModelEvaluation:
 
         # Prepare columns for shapefile export (same as Excel plus geometry)
         # Shapefile field names limited to 10 characters, so use abbreviated names
-        export_gdf = clipped_gdf[['ID', 'Area_ha', 'ActualDef', 'PredDef', 'Residuals', 'geometry']].copy()
+        export_gdf = clipped_gdf[['ID', 'Area_ha', actual_field, predicted_field, 'Residuals', 'geometry']].copy()
         export_gdf.to_file(shapefile_fn)
 
         print("=" * 60 + "\n")
@@ -532,12 +601,15 @@ class ModelEvaluation:
 
     def create_deforestation_map(self, fmask, deforestation_cal, deforestation_cnf, out_fn_def):
         '''
-        Create combined deforestation map showing forest, deforestation in CAL, and deforestation in CNF
+        Create combined change map showing forest, change in CAL, and change in CNF.
+
+        Writes class codes only (1/2/3) — the words live in replace_legend, which takes the
+        benchmark type — so this one needs no vocabulary of its own.
 
         :param fmask: Forest mask at the start of HRP
-        :param deforestation_cal: Deforestation map during CAL period
-        :param deforestation_cnf: Deforestation map during CNF period
-        :param out_fn_def: Output path for combined deforestation map
+        :param deforestation_cal: change map during CAL period
+        :param deforestation_cnf: change map during CNF period
+        :param out_fn_def: Output path for the combined change map
         :return: None
         '''
         arr_fmask = image_to_array(fmask)
@@ -556,7 +628,8 @@ class ModelEvaluation:
 
         return
 
-    def create_plot(self, grid_area, clipped_gdf, title, out_fn, xmax=None, ymax=None):
+    def create_plot(self, grid_area, clipped_gdf, title, out_fn, xmax=None, ymax=None,
+                    benchmark_type=BENCHMARK_DF):
         '''
         Create plot and save to local directory
         :param grid_area: assessment grid cell area or 100,000 (ha)
@@ -565,16 +638,27 @@ class ModelEvaluation:
         :param out_fn: plot path
         :param xmax: maximum x-axis value
         :param ymax: maximum y-axis value
+        :param benchmark_type: "deforestation" (default) or "degradation" — axis labels and the
+                               statistics file wording; the regression, R² and MedAE are unchanged
+        :note: observed and predicted are normalised to the nominal grid area before any
+               statistic is computed — see the block below the X/Y extraction
         :return: None
         '''
+        plt, sns = _plotting_backend()
+
+        _t = terms(benchmark_type)
+        # create_thiessen_polygon renamed the columns to the shapefile field names before
+        # returning, so read them under the same pair.
+        actual_field, predicted_field = residual_fields(benchmark_type)
+
         # Set Seaborn Style
         sns.set_theme()
 
-        # Filter out cells where BOTH ActualDef and PredDef are zero or near-zero
+        # Filter out cells where BOTH the actual and predicted values are zero or near-zero
         # This prevents division by zero and improves regression quality
         # Keep cells where at least one value is greater than a small threshold (0.01 ha)
         threshold = 0.01
-        valid_mask = (clipped_gdf['ActualDef'] > threshold) | (clipped_gdf['PredDef'] > threshold)
+        valid_mask = (clipped_gdf[actual_field] > threshold) | (clipped_gdf[predicted_field] > threshold)
         clipped_gdf_filtered = clipped_gdf[valid_mask].copy()
 
         # Check if we have enough data points BEFORE filtering
@@ -628,8 +712,33 @@ class ModelEvaluation:
             clipped_gdf_filtered = clipped_gdf.copy()
 
         # prepare the X/Y data
-        X = np.array(clipped_gdf_filtered['ActualDef'], dtype=np.float64)
-        Y = np.array(clipped_gdf_filtered['PredDef'], dtype=np.float64)
+        X = np.array(clipped_gdf_filtered[actual_field], dtype=np.float64)
+        Y = np.array(clipped_gdf_filtered[predicted_field], dtype=np.float64)
+
+        # --- Normalise to a common cell area -------------------------------------------
+        # Exclusions leave the assessment cells unequal in area, and an error in absolute
+        # hectares is then not comparable from one cell to another: a cell trimmed to 75 % of
+        # full size holds proportionally less of everything, residual included, and pulls the
+        # median accordingly. Both observed and predicted are therefore scaled to the nominal
+        # grid area before any statistic is taken, so every cell contributes on equal footing.
+        #
+        # A_ref is the NOMINAL grid area, not the largest observed cell: it is a constant of the
+        # method rather than a property of this particular sample, which keeps MedAE comparable
+        # between runs and between jurisdictions, and matches the denominator already used to
+        # express MedAE as a percentage.
+        area_ha = np.array(clipped_gdf_filtered['Area_ha'], dtype=np.float64)
+        if np.any(area_ha <= 0):
+            raise ValueError("create_plot: an assessment cell has zero or negative area; "
+                             "residuals cannot be normalised to a common basis.")
+        scale = float(grid_area) / area_ha
+        # Aggregate statistics (IoU, Agreement, Difference) are computed on these raw hectares:
+        # they sum over all cells rather than comparing them, so they keep a physical reading and
+        # normalising would overweight the cells the exclusions trimmed.
+        X_raw, Y_raw = X.copy(), Y.copy()
+        X = X * scale
+        Y = Y * scale
+        print(f"Residuals normalised to the nominal grid area ({float(grid_area):,.2f} ha); "
+              f"cell scaling factors {scale.min():.4f}–{scale.max():.4f}")
 
         ## Perform linear regression
         slope, intercept, _, _, _ = stats.linregress(X, Y)
@@ -646,12 +755,28 @@ class ModelEvaluation:
         # Square the correlation coefficient
         r_squared = r ** 2
 
-        ##Calculate MedAE
-        distance_arr = [abs(X[i] - Y[i]) for i in range(len(X))]
-        MedAE = np.median(distance_arr)
-
-        ## Calculate MedAE percent
+        ## Per-cell error statistics, on the normalised values: each cell is one observation,
+        ## and cells of unequal area are only comparable once normalised.
+        distance_arr = np.abs(X - Y)
+        MedAE = float(np.median(distance_arr))
         MedAE_percent = (MedAE / int(grid_area)) * 100
+        MAE = float(np.mean(distance_arr))
+        MAE_percent = (MAE / int(grid_area)) * 100
+
+        # The same two statistics on the raw hectares, reported for traceability so the effect of
+        # the normalisation is visible rather than implicit.
+        raw_distance = np.abs(X_raw - Y_raw)
+        MedAE_raw = float(np.median(raw_distance))
+        MAE_raw = float(np.mean(raw_distance))
+
+        ## Aggregate agreement statistics, on the RAW hectares (see the note at the normalisation).
+        ## Agreement is the area both maps place change in; Difference the total absolute error;
+        ## IoU their ratio -- a measure of spatial overlap rather than of error size. A model can
+        ## have a good MedAE and a poor IoU if it gets the quantities right but the locations wrong.
+        agreement = float(np.minimum(X_raw, Y_raw).sum())
+        union = float(np.maximum(X_raw, Y_raw).sum())
+        iou = 0.0 if union == 0 else agreement / union * 100
+        difference = float(raw_distance.sum())
 
         # Set the figure size
         plt.figure(figsize=(8, 6))
@@ -660,17 +785,18 @@ class ModelEvaluation:
         plt.scatter(X, Y, color='steelblue', alpha=0.5, linewidth=1.0, s=50)
 
         # Add labels and title
-        plt.xlabel('Actual Deforestation (ha)', color='black', fontweight='bold', labelpad=10)
-        plt.ylabel('Predicted Deforestation (ha)', color='black', fontweight='bold', labelpad=10)
+        plt.xlabel(f'Actual {_t.noun} (ha, normalised to grid area)', color='black',
+                   fontweight='bold', labelpad=10)
+        plt.ylabel(f'Predicted {_t.noun} (ha, normalised to grid area)', color='black',
+                   fontweight='bold', labelpad=10)
         plt.title(title, color='firebrick', fontweight='bold', fontsize=20, pad=20)
 
-        # Plot the trend line
-        plt.plot(X, trend_line, color='mediumseagreen', linestyle='-', label='OLS Line')
-
-        # Plot a 1-to-1 line (using filtered data)
-        max_val = max(X.max(), Y.max())
-        plt.plot([0, max_val], [0, max_val], color='crimson', linestyle='--',
-                 label='1:1 Line')
+        # Lines are drawn across the whole axis rather than only over the observed range, so that
+        # where each one crosses the axes is visible.
+        X_extended = np.linspace(0, max(X.max(), Y.max()) * 1.1, 500)
+        plt.plot(X_extended, slope * X_extended + intercept, color='mediumseagreen',
+                 linestyle='-', label='OLS Line')
+        plt.plot(X_extended, X_extended, color='crimson', linestyle='--', label='1:1 Line')
 
         ## Theil-Sen Regressor
         # Fit Theil-Sen Regressor
@@ -684,7 +810,8 @@ class ModelEvaluation:
         ts_equation = f'Y = {ts_slope:.4f} * X + {ts_intercept:.2f}'
 
         # Plot Theil-Sen Line
-        plt.plot(X, y_pred, color='orange', linestyle='-', label='Theil-Sen Line')
+        plt.plot(X_extended, ts_slope * X_extended + ts_intercept, color='orange',
+                 linestyle='-', label='Theil-Sen Line')
 
         # Add a legend in the bottom right position
         plt.legend(loc='lower right')
@@ -716,8 +843,12 @@ class ModelEvaluation:
         plt.text(text_x_pos, text_y_start_pos - text_y_gap, f'OLS : {equation}', fontsize=11, color='black')
         plt.text(text_x_pos, text_y_start_pos - 2 * text_y_gap, f'Samples = {len(X)}', fontsize=11, color='black')
         plt.text(text_x_pos, text_y_start_pos - 3 * text_y_gap, f'R^2 = {r_squared:.4f}', fontsize=11, color='black')
-        plt.text(text_x_pos, text_y_start_pos - 4 * text_y_gap, f'MedAE = {MedAE:.2f} ({MedAE_percent:.2f}%)',
-                 fontsize=11, color='black')
+        plt.text(text_x_pos, text_y_start_pos - 4 * text_y_gap,
+                 f'MedAE = {MedAE:.2f} ({MedAE_percent:.2f}%)', fontsize=11, color='black')
+        plt.text(text_x_pos, text_y_start_pos - 5 * text_y_gap,
+                 f'MAE = {MAE:.2f} ({MAE_percent:.2f}%)', fontsize=11, color='black')
+        plt.text(text_x_pos, text_y_start_pos - 6 * text_y_gap,
+                 f'IoU = {iou:.2f}%', fontsize=11, color='black')
 
         # x, yticks
         plt.yticks(fontsize=10, color='dimgrey')
@@ -751,13 +882,64 @@ class ModelEvaluation:
 
         plt.close()  # Close the figure to free memory and release file handles
 
+        # Interactive companion to the PNG. Hovering a point names the cell and its figures, which
+        # is what a reader needs to ask which cell is off rather than merely that one is. Plotly is
+        # imported here so that it is not pulled in by every module that touches this package.
+        try:
+            import plotly.graph_objects as go
+            import plotly.io as pio
+
+            ids = (np.asarray(clipped_gdf_filtered["ID"]) if "ID" in clipped_gdf_filtered
+                   else np.arange(1, len(X) + 1))
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=X, y=Y, mode="markers", name="Assessment cells", showlegend=False,
+                customdata=np.stack([ids, area_ha, X_raw, Y_raw, raw_distance], axis=-1),
+                hovertemplate=(
+                    "Cell %{customdata[0]}<br>"
+                    "Cell area: %{customdata[1]:,.0f} ha<br>"
+                    "<b>Normalised</b> observed %{x:,.2f} / predicted %{y:,.2f} ha<br>"
+                    "<b>Raw</b> observed %{customdata[2]:,.2f} / predicted %{customdata[3]:,.2f} ha"
+                    "<br>Raw absolute error: %{customdata[4]:,.2f} ha<extra></extra>"),
+                marker=dict(size=8, color="steelblue", opacity=0.6,
+                            line=dict(width=0.5, color="white"))))
+            for xs, ys, nm, col, dash in (
+                    (X_extended, slope * X_extended + intercept, "OLS", "mediumseagreen", "solid"),
+                    (X_extended, ts_slope * X_extended + ts_intercept, "Theil-Sen", "orange", "solid"),
+                    (X_extended, X_extended, "1:1", "crimson", "dash")):
+                fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=nm, hoverinfo="skip",
+                                         line=dict(color=col, dash=dash)))
+            fig.update_layout(
+                title=dict(text=f"<b>{title}</b>", x=0.5, xanchor="center",
+                           font=dict(color="firebrick", size=18)),
+                xaxis=dict(title=f"<b>Actual {_t.noun} (ha, normalised)</b>", range=[0, xmax]),
+                yaxis=dict(title=f"<b>Predicted {_t.noun} (ha, normalised)</b>", range=[0, ymax]),
+                hovermode="closest", paper_bgcolor="white", plot_bgcolor="rgb(234,234,242)",
+                legend=dict(x=0.99, y=0.01, xanchor="right", yanchor="bottom"),
+                margin=dict(l=60, r=30, t=70, b=60))
+            fig.add_annotation(
+                x=0.02, y=0.98, xref="paper", yref="paper", xanchor="left", yanchor="top",
+                showarrow=False, align="left",
+                text=(f"Theil-Sen: {ts_equation}<br>OLS: {equation}<br>Samples = {len(X)}<br>"
+                      f"R\u00b2 = {r_squared:.4f}<br>"
+                      f"MedAE = {MedAE:.2f} ({MedAE_percent:.2f}%)<br>"
+                      f"MAE = {MAE:.2f} ({MAE_percent:.2f}%)<br>IoU = {iou:.2f}%"))
+            html_out = os.path.splitext(out_fn)[0] + ".html"
+            pio.write_html(fig, file=html_out, include_plotlyjs=True, full_html=True)
+            print(f"Interactive plot saved: {os.path.basename(html_out)}")
+        except ImportError:
+            print("[INFO] plotly not available; the interactive HTML plot was skipped.")
+
         # Save statistics to text file
         stats_txt = os.path.splitext(out_fn)[0] + '_statistics.txt'
         with open(stats_txt, 'w', encoding='utf-8') as f:
             f.write("Model Evaluation Statistics\n")
             f.write("=" * 60 + "\n\n")
             f.write(f"Title: {title}\n")
-            f.write(f"Grid Area: {grid_area:,} ha\n\n")
+            f.write(f"Grid Area: {grid_area:,} ha\n")
+            f.write("Observed and predicted values are normalised to the nominal grid\n")
+            f.write("area (scaled by grid_area / cell_area), so that residuals are\n")
+            f.write("comparable across cells left unequal in area by the exclusions.\n\n")
 
             f.write("Regression Analysis\n")
             f.write("-" * 60 + "\n")
@@ -768,16 +950,30 @@ class ModelEvaluation:
             f.write("-" * 60 + "\n")
             f.write(f"Number of Samples:    {len(X)}\n")
             f.write(f"R-squared (R²):       {r_squared:.4f}\n")
-            f.write(f"Median Absolute Error (MedAE): {MedAE:.2f} ha ({MedAE_percent:.2f}%)\n\n")
+            f.write(f"Median Absolute Error (MedAE): {MedAE:.2f} ha ({MedAE_percent:.2f}%)\n")
+            f.write(f"Mean Absolute Error (MAE):     {MAE:.2f} ha ({MAE_percent:.2f}%)\n\n")
+
+            f.write("Spatial Agreement\n")
+            f.write("-" * 60 + "\n")
+            f.write("Computed on raw hectares, not normalised: these aggregate over all\n")
+            f.write("cells rather than comparing them, so they keep a physical reading.\n")
+            f.write(f"Agreement (area both maps agree on): {agreement:,.2f} ha\n")
+            f.write(f"Difference (total absolute error):   {difference:,.2f} ha\n")
+            f.write(f"IoU (Agreement / Union):             {iou:.2f} %\n\n")
+
+            f.write("Without normalisation, for traceability\n")
+            f.write("-" * 60 + "\n")
+            f.write(f"MedAE on raw hectares: {MedAE_raw:.2f} ha\n")
+            f.write(f"MAE on raw hectares:   {MAE_raw:.2f} ha\n\n")
 
             f.write("Data Range\n")
             f.write("-" * 60 + "\n")
-            f.write(f"Actual Deforestation:\n")
+            f.write(f"Actual {_t.noun} (normalised):\n")
             f.write(f"  Minimum:  {X.min():.2f} ha\n")
             f.write(f"  Maximum:  {X.max():.2f} ha\n")
             f.write(f"  Mean:     {X.mean():.2f} ha\n")
             f.write(f"  Std Dev:  {X.std():.2f} ha\n\n")
-            f.write(f"Predicted Deforestation:\n")
+            f.write(f"Predicted {_t.noun} (normalised):\n")
             f.write(f"  Minimum:  {Y.min():.2f} ha\n")
             f.write(f"  Maximum:  {Y.max():.2f} ha\n")
             f.write(f"  Mean:     {Y.mean():.2f} ha\n")
@@ -867,7 +1063,7 @@ class ModelEvaluation:
         return output_path
 
     def run_evaluation(self, grid_area, density_map, deforestation_map, mask_voronoi, mask_exclusions, title, out_fn,
-                       xmax="default", ymax="default"):
+                       xmax="default", ymax="default", benchmark_type=BENCHMARK_DF):
         """
         Run model evaluation for Testing Stage CAL or CNF phases.
 
@@ -879,13 +1075,15 @@ class ModelEvaluation:
         Args:
             grid_area: Assessment grid cell area in hectares (e.g., 50000 for 50km²)
             density_map: Path to density map (fitting or adjusted prediction density)
-            deforestation_map: Path to deforestation map (CAL: T1-T2, CNF: T2-T3)
+            deforestation_map: Path to the observed change map (CAL: T1-T2, CNF: T2-T3)
             mask_voronoi: Full jurisdictional mask for Voronoi generation (no exclusions)
             mask_exclusions: Jurisdictional mask with exclusions for final statistics
             title: Title for the evaluation plot
             out_fn: Output path for the plot PNG file
             xmax: Maximum x-axis value (default: "default" for auto-scale)
             ymax: Maximum y-axis value (default: "default" for auto-scale)
+            benchmark_type: "deforestation" (default) or "degradation" — the vocabulary of the
+                plot axes, the grid table columns and the residuals shapefile fields
 
         Returns:
             None
@@ -913,7 +1111,8 @@ class ModelEvaluation:
                 density=density_map,
                 deforestation=deforestation_map,
                 out_fn=grid_excel,
-                raster_fn=residuals_map
+                raster_fn=residuals_map,
+                benchmark_type=benchmark_type
             )
 
             # Create the evaluation plot
@@ -923,7 +1122,8 @@ class ModelEvaluation:
                 title=title,
                 out_fn=out_fn,
                 xmax=xmax,
-                ymax=ymax
+                ymax=ymax,
+                benchmark_type=benchmark_type
             )
 
             # Cleanup
@@ -944,12 +1144,12 @@ def evaluate_testing_stage(folders, fcbm_file, jnr_lb_full_areas, jnr_with_exclu
                            evaluation_xmax="default", evaluation_ymax="default",
                            project_name=None, version=None,
                            run_eval_cal=True, run_eval_cnf=True,
-                           cancel_flag=None):
+                           cancel_flag=None, benchmark_type=BENCHMARK_DF):
     """
     Run model evaluation for Fitting (CAL) and/or Prediction (CNF) phases of the Testing Stage.
 
     This function evaluates the model performance by comparing predicted density maps
-    against actual deforestation maps using grid-based analysis. It automatically locates
+    against the observed change maps using grid-based analysis. It automatically locates
     the required files based on the VT7 folder structure and model type.
 
     Args:
@@ -967,6 +1167,8 @@ def evaluate_testing_stage(folders, fcbm_file, jnr_lb_full_areas, jnr_with_exclu
         run_eval_cal: Whether to run evaluation for CAL phase (default: True)
         run_eval_cnf: Whether to run evaluation for CNF phase (default: True)
         cancel_flag: Optional callback function that returns True to cancel operation
+        benchmark_type: "deforestation" (default) or "degradation" — labels the plots, the grid
+            tables and the residuals shapefiles; the FCBM classes read are the same in both
 
     Returns:
         dict: Dictionary containing evaluation output paths:
@@ -1015,7 +1217,8 @@ def evaluate_testing_stage(folders, fcbm_file, jnr_lb_full_areas, jnr_with_exclu
 
     # Generate deforestation maps on-demand from FCBM and run evaluations
     # All evaluation must happen inside the temp directory context
-    with tempfile.TemporaryDirectory() as temp_dir:
+    # ignore_cleanup_errors: a stray GDAL handle must not bury the real error.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         # Mask FCBM to the area of interest
         fcbm_masked = os.path.join(temp_dir, "fcbm_masked.tif")
         expression_mask = "if(map1[1] == 1, map2[1], no_data)"
@@ -1074,7 +1277,8 @@ def evaluate_testing_stage(folders, fcbm_file, jnr_lb_full_areas, jnr_with_exclu
                 title=f"VT7 {model_name} - Fitting Phase (CAL)",
                 out_fn=evaluation_cal_plot,
                 xmax=evaluation_xmax,
-                ymax=evaluation_ymax
+                ymax=evaluation_ymax,
+                benchmark_type=benchmark_type
             )
 
             print(f"CAL Evaluation plot saved: {evaluation_cal_plot}")
@@ -1100,7 +1304,8 @@ def evaluate_testing_stage(folders, fcbm_file, jnr_lb_full_areas, jnr_with_exclu
                 title=f"VT7 {model_name} - Prediction Phase (CNF)",
                 out_fn=evaluation_cnf_plot,
                 xmax=evaluation_xmax,
-                ymax=evaluation_ymax
+                ymax=evaluation_ymax,
+                benchmark_type=benchmark_type
             )
 
             print(f"CNF Evaluation plot saved: {evaluation_cnf_plot}")

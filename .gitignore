@@ -1,0 +1,17 @@
+# Byte-compiled — regenerated on every run, never part of the distribution
+__pycache__/
+*.py[cod]
+
+# Environments
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Word lock files, left behind when a document is open or Word crashed
+~$*

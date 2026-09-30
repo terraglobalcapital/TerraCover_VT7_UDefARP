@@ -31,26 +31,32 @@ gdal.UseExceptions()
 
 try:
     from .utils import image_to_array, array_to_image, replace_ref_system, raster_calculator
+    from .terminology import BENCHMARK_DF, terms
 except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
     from terracover.modules.vt7.utils import image_to_array, array_to_image, replace_ref_system, raster_calculator
+    from terracover.modules.vt7.terminology import BENCHMARK_DF, terms
 
 
-def calculate_adjustment_ratio_cnf(prediction_density_arr, deforestation_cnf=None, return_components=False, expected_deforestation=None):
+def calculate_adjustment_ratio_cnf(prediction_density_arr, deforestation_cnf=None, return_components=False,
+                                   expected_deforestation=None, benchmark_type=BENCHMARK_DF):
     '''
     Calculate the Adjustment Ratio (AR) in CNF
-    :param prediction_density_arr: modeled deforestation (MD)
-    :param deforestation_cnf: deforestation binary map in cnf (optional if expected_deforestation is provided)
+    :param prediction_density_arr: modeled change (MD)
+    :param deforestation_cnf: binary change map in cnf (optional if expected_deforestation is provided);
+                              the degradation map on an FCBM-DG run
     :param return_components: if True, returns (AR, AD, MD) instead of just AR
-    :param expected_deforestation: Expected deforestation in hectares (optional).
+    :param expected_deforestation: Expected area in hectares (optional).
                                     If provided, AD will use this value instead of calculating from deforestation_cnf
+    :param benchmark_type: "deforestation" (default) or "degradation" — wording of the error messages only
     :return: AR or (AR, AD, MD) tuple if return_components=True
     '''
+    _t = terms(benchmark_type)
 
-    # Sum up the pixels in the prediction density map. This is the modeled deforestation (MD).
+    # Sum up the pixels in the prediction density map. This is the modeled area (MD).
     MD = np.sum(prediction_density_arr)
 
-    # Calculate the Actual Deforestation (AD) during the confirmation period
+    # Calculate the Actual area (AD) during the confirmation period
     # Unless expected_deforestation is provided
     if expected_deforestation is not None:
         AD = expected_deforestation
@@ -72,19 +78,23 @@ def calculate_adjustment_ratio_cnf(prediction_density_arr, deforestation_cnf=Non
         arr5 = image_to_array(deforestation_cnf)
 
         # Create mask to exclude nodata values (typically 255 for uint8)
-        # Only include pixels with value = 1 (deforestation)
+        # Only include pixels with value = 1 (change)
         if nodata_value is not None:
             valid_mask = (arr5 == 1) & (arr5 != nodata_value)
         else:
             valid_mask = (arr5 == 1)
 
-        # Apply mask: only calculate AD for valid deforestation pixels
+        # Apply mask: only calculate AD for valid change pixels
         arr5_ha = np.where(valid_mask, arr5 * areal_resolution_of_map_pixels, 0)
 
-        # Calculate the Actual Deforestation (AD) during the confirmation period
+        # Calculate the Actual area (AD) during the confirmation period
         AD = np.sum(arr5_ha)
 
-    # AR = AD / MD
+    # AR = AD / MD. MD == 0 (the model predicted zero change over the whole area) makes AR
+    # undefined; it is unreachable with real inputs, so flag it rather than emit an inf/nan ratio
+    # that would silently corrupt the adjusted prediction.
+    if MD == 0:
+        raise ValueError(f"MD (modeled {_t.lower}) is 0 — the Adjustment Ratio AR = AD / MD is undefined")
     AR = AD / MD
 
     if return_components:
@@ -96,7 +106,7 @@ def calculate_adjustment_ratio_cnf(prediction_density_arr, deforestation_cnf=Non
 def adjusted_prediction_density_array(prediction_density_arr, risk30, AR):
     '''
     Create adjusted prediction density array
-    :param prediction_density_arr:modeled deforestation (MD)
+    :param prediction_density_arr:modeled change (MD)
     :param risk30: risk30 image
     :param AR:Adjustment Ratio
     :return: adjusted_prediction_density_np_arr
@@ -119,7 +129,8 @@ def adjusted_prediction_density_array(prediction_density_arr, risk30, AR):
 
 # Create adjusted prediction density maps. Iterative adjustment to converge AR to 1.0
 def iterative_ar_adjustment(prediction_density_arr, risk30, out_fn, log_fn, deforestation_cnf=None, max_iterations=5,
-                             tolerance=1.00001, expected_deforestation=None, vp_years=None):
+                             tolerance=1.00001, expected_deforestation=None, vp_years=None,
+                             benchmark_type=BENCHMARK_DF):
     '''
     Iteratively adjust the prediction density array until AR converges to 1.0
     Following VT7 methodology: applies AR accumulatively to previous iteration's result
@@ -128,17 +139,20 @@ def iterative_ar_adjustment(prediction_density_arr, risk30, out_fn, log_fn, defo
     :param risk30: vulnerability map (risk30 image path)
     :param out_fn: output file path for the adjusted prediction density map
     :param log_fn: Path to the log file (required)
-    :param deforestation_cnf: deforestation binary map in cnf (optional if expected_deforestation is provided)
+    :param deforestation_cnf: binary change map in cnf (optional if expected_deforestation is provided)
     :param max_iterations: maximum number of iterations to avoid infinite loop (default: 5)
     :param tolerance: AR tolerance threshold (default: 1.00001)
-    :param expected_deforestation: Expected deforestation in hectares (optional).
+    :param expected_deforestation: Expected area in hectares (optional).
                                     If provided, AD will use this value instead of calculating from deforestation_cnf
     :param vp_years: Length of the Validity Period in years (optional, only for VP phase).
-                     If provided, the output will be converted to annual deforestation rate by dividing by this value.
+                     If provided, the output will be converted to an annual rate by dividing by this value.
                      This follows VT0007 methodology for the Validity Period prediction phase.
                      For CNF phase, leave as None to output total density without annual conversion.
+    :param benchmark_type: "deforestation" (default) or "degradation" — wording of the AR log only;
+                           every number in it is computed identically
     :return: final adjusted prediction density array
     '''
+    _t = terms(benchmark_type)
 
     # Start with the original prediction density array
     current_density_arr = prediction_density_arr.copy()
@@ -146,28 +160,30 @@ def iterative_ar_adjustment(prediction_density_arr, risk30, out_fn, log_fn, defo
     # Calculate initial AR with components
     AR, AD, MD = calculate_adjustment_ratio_cnf(current_density_arr, deforestation_cnf,
                                                  return_components=True,
-                                                 expected_deforestation=expected_deforestation)
+                                                 expected_deforestation=expected_deforestation,
+                                                 benchmark_type=benchmark_type)
 
     # Initialize log list
     log_lines = []
     log_lines.append("VT7 Iterative AR Adjustment Log")
     log_lines.append("=" * 60)
-    log_lines.append(f"Deforestation Map: {deforestation_cnf}")
+    log_lines.append(f"Benchmark Type: {_t.benchmark_type}")
+    log_lines.append(f"{_t.noun} Map: {deforestation_cnf}")
     log_lines.append(f"Output File: {out_fn}")
     log_lines.append(f"Max Iterations: {max_iterations}")
     log_lines.append(f"Tolerance: {tolerance}")
     if expected_deforestation is not None:
-        log_lines.append(f"Expected Deforestation: {expected_deforestation:,.2f} ha (AD will use this value)")
+        log_lines.append(f"Expected {_t.noun}: {expected_deforestation:,.2f} ha (AD will use this value)")
     if vp_years is not None:
         log_lines.append(f"VP Years: {vp_years} (output will be converted to annual rate)")
     log_lines.append("=" * 60)
     log_lines.append("")
     log_lines.append(f"Initial State:")
-    log_lines.append(f"  MD (Modeled Deforestation):  {MD:,.2f} ha")
+    log_lines.append(f"  MD (Modeled {_t.noun}):  {MD:,.2f} ha")
     if expected_deforestation is not None:
-        log_lines.append(f"  AD (Expected Deforestation): {AD:,.2f} ha")
+        log_lines.append(f"  AD (Expected {_t.noun}): {AD:,.2f} ha")
     else:
-        log_lines.append(f"  AD (Actual Deforestation):   {AD:,.2f} ha")
+        log_lines.append(f"  AD (Actual {_t.noun}):   {AD:,.2f} ha")
     log_lines.append(f"  AR (Adjustment Ratio):       {AR:.6f}")
     log_lines.append("")
 
@@ -183,15 +199,16 @@ def iterative_ar_adjustment(prediction_density_arr, risk30, out_fn, log_fn, defo
         # Recalculate AR based on the adjusted array
         AR, AD, MD = calculate_adjustment_ratio_cnf(current_density_arr, deforestation_cnf,
                                                      return_components=True,
-                                                     expected_deforestation=expected_deforestation)
+                                                     expected_deforestation=expected_deforestation,
+                                                     benchmark_type=benchmark_type)
 
         # Log this iteration
         log_lines.append(f"Iteration {iteration_count}:")
-        log_lines.append(f"  MD (Modeled Deforestation):  {MD:,.2f} ha")
+        log_lines.append(f"  MD (Modeled {_t.noun}):  {MD:,.2f} ha")
         if expected_deforestation is not None:
-            log_lines.append(f"  AD (Expected Deforestation): {AD:,.2f} ha")
+            log_lines.append(f"  AD (Expected {_t.noun}): {AD:,.2f} ha")
         else:
-            log_lines.append(f"  AD (Actual Deforestation):   {AD:,.2f} ha")
+            log_lines.append(f"  AD (Actual {_t.noun}):   {AD:,.2f} ha")
         log_lines.append(f"  AR (Adjustment Ratio):       {AR:.6f}")
         log_lines.append("")
 
@@ -209,11 +226,11 @@ def iterative_ar_adjustment(prediction_density_arr, risk30, out_fn, log_fn, defo
     if vp_years is not None and vp_years > 0:
         output_density_arr = current_density_arr / vp_years
         log_lines.append(f"  Annual Conversion: Divided by {vp_years} years")
-        log_lines.append(f"  Output Type: Annual deforestation rate (ha/year per pixel)")
+        log_lines.append(f"  Output Type: Annual {_t.lower} rate (ha/year per pixel)")
     else:
         output_density_arr = current_density_arr
         log_lines.append(f"  Annual Conversion: None (CNF phase)")
-        log_lines.append(f"  Output Type: Total deforestation density (ha per pixel)")
+        log_lines.append(f"  Output Type: Total {_t.lower} density (ha per pixel)")
     log_lines.append("=" * 60)
 
     # Write log file
@@ -222,7 +239,8 @@ def iterative_ar_adjustment(prediction_density_arr, risk30, out_fn, log_fn, defo
 
     # Save the final adjusted array to temporary file, then apply mask
     import tempfile
-    with tempfile.TemporaryDirectory() as temp_folder:
+    # ignore_cleanup_errors: a stray GDAL handle must not bury the real error.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_folder:
         temp_out = os.path.join(temp_folder, "temp_adjusted_density.tif")
         array_to_image(risk30, temp_out, output_density_arr, gdal.GDT_Float32, -1)
         replace_ref_system(risk30, temp_out)

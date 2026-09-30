@@ -33,26 +33,31 @@ gdal.UseExceptions()
 
 try:
     from .folder_structure import VT7FolderStructure
-    from .geometric_classification import nrt_calculation, geometric_classification, geometric_classification_alternative
+    from .geometric_classification import nrt_calculation, geometric_classification, kmeans_classification_alternative
     from .frequency_analysis import tabulation_bin_id, calculate_missing_bins_rf, create_relative_frequency_table, create_fit_density_map
     from .adjustment import calculate_adjustment_ratio_cnf, iterative_ar_adjustment
     from .evaluation import evaluate_testing_stage
     from .utils import admin_divisions_to_raster, read_nrt_value, build_filename, euclidean_distance, raster_calculator
+    from .terminology import BENCHMARK_DF, align_frequency_columns
 except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
     from terracover.modules.vt7.folder_structure import VT7FolderStructure
-    from terracover.modules.vt7.geometric_classification import nrt_calculation, geometric_classification, geometric_classification_alternative
+    from terracover.modules.vt7.geometric_classification import nrt_calculation, geometric_classification, kmeans_classification_alternative
     from terracover.modules.vt7.frequency_analysis import tabulation_bin_id, calculate_missing_bins_rf, create_relative_frequency_table, create_fit_density_map
     from terracover.modules.vt7.adjustment import calculate_adjustment_ratio_cnf, iterative_ar_adjustment
     from terracover.modules.vt7.evaluation import evaluate_testing_stage
     from terracover.modules.vt7.utils import admin_divisions_to_raster, read_nrt_value, build_filename, euclidean_distance, raster_calculator
+    from terracover.modules.vt7.terminology import BENCHMARK_DF, align_frequency_columns
 
 
 # ======================================
 # VT7 Input Generation (on-demand)
 # ======================================
 
-# FCBM class expressions for generating VT7 maps
+# FCBM class expressions for generating VT7 maps.
+# VT7 interpretation of the FCBM index (see fcbm.py): classes 1-4 are all "stable non-forest" —
+# regrowth inside the HRP (the F in the NF-F-NF / NF-NF-F patterns) does NOT count as forest in any
+# period. So forest per period is: T1 {5,6,7,8}, T2 {5,8}, T3 {5}.
 VT7_MAP_EXPRESSIONS = {
     "HRP_deforestation": "if((map1[1]==6) | (map1[1]==7) | (map1[1]==8), 1, if(map1[1]==no_data, no_data, 0))",
     "T1_forest": "if((map1[1]==5) | (map1[1]==6) | (map1[1]==7) | (map1[1]==8), 1, if(map1[1]==no_data, no_data, 0))",
@@ -111,7 +116,8 @@ def _generate_distance_map(non_forest_file, mask_file, output_file):
         mask_file: Path to binary mask
         output_file: Path to output distance file
     """
-    with tempfile.TemporaryDirectory() as temp_dir:
+    # ignore_cleanup_errors: a stray GDAL handle must not bury the real error.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         # Calculate unmasked distance
         distance_temp = os.path.join(temp_dir, "distance_temp.tif")
         euclidean_distance(non_forest_file, distance_temp, raster_value=1)
@@ -135,7 +141,7 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
                       alt_etp_cal_image=None, alt_etp_cnf_image=None,
                       project_name=None, version=None,
                       run_cal=True, run_cnf=True,
-                      cancel_flag=None):
+                      cancel_flag=None, benchmark_type=BENCHMARK_DF):
     """
     Run the Testing Stage for the JNR Benchmark or Alternative Model.
 
@@ -159,6 +165,9 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
         run_cal: Whether to run the Calibration (CAL) phase (default: True)
         run_cnf: Whether to run the Confirmation (CNF) phase (default: True)
         cancel_flag: Optional callback function that returns True to cancel operation
+        benchmark_type: "deforestation" (default) or "degradation" — the output vocabulary
+            (NRT plots, frequency table columns, AR log). Nothing computed changes with it:
+            the FCBM indices 6/7/8 mean the same in the FCBM-DG.
 
     Returns:
         dict: Dictionary containing key outputs and paths
@@ -211,7 +220,8 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
     frequency_table_cal = None
 
     # Use a persistent temp directory for VT7 inputs that need to be shared between phases
-    with tempfile.TemporaryDirectory() as vt7_temp_dir:
+    # ignore_cleanup_errors: a stray GDAL handle must not bury the real error.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as vt7_temp_dir:
         # Generate masked FCBM
         fcbm_masked = os.path.join(vt7_temp_dir, "fcbm_masked.tif")
         _generate_masked_fcbm(fcbm_file, jnr_with_exclusions_mask, fcbm_masked)
@@ -245,7 +255,8 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
 
                 vulnerability_cal_name = build_filename(f"04_{prefix}_Vulnerability_CAL.tif", project_name, version)
                 vulnerability_cal = os.path.join(fitting_folder, vulnerability_cal_name)
-                nrt = nrt_calculation(t1_distance_cal, hrp_deforestation, jnr_with_exclusions_mask, fitting_folder, project_name, version)
+                nrt = nrt_calculation(t1_distance_cal, hrp_deforestation, jnr_with_exclusions_mask, fitting_folder, project_name, version,
+                                      benchmark_type=benchmark_type)
                 nrt_txt_name = build_filename("03_BCM_NRT_value.txt", project_name, version)
                 nrt_txt = os.path.join(fitting_folder, nrt_txt_name)
                 geometric_classification(t1_distance_cal, vulnerability_cal, nrt, n_classes, nrt_txt=nrt_txt)
@@ -255,7 +266,7 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
 
                 vulnerability_cal_name = build_filename(f"01_{prefix}_Vulnerability_CAL.tif", project_name, version)
                 vulnerability_cal = os.path.join(fitting_folder, vulnerability_cal_name)
-                geometric_classification_alternative(alt_etp_cal_image, n_classes, jnr_with_exclusions_mask, t1_forest, vulnerability_cal)
+                kmeans_classification_alternative(alt_etp_cal_image, n_classes, jnr_with_exclusions_mask, t1_forest, vulnerability_cal)
                 nrt = None
 
             # Step 2: Create the Modeling Regions Map
@@ -268,7 +279,8 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
             frequency_map_cal = os.path.join(fitting_folder, frequency_map_cal_name)
             frequency_table_cal_name = build_filename(f"0{'6' if model_type == 'benchmark' else '3'}_{prefix}_Relative_Frequency_Table_CAL.xlsx", project_name, version)
             frequency_table_cal = os.path.join(fitting_folder, frequency_table_cal_name)
-            frequency_table_cal_df = create_relative_frequency_table(modelling_regions_cal_array, t1t2_deforestation, frequency_table_cal, frequency_map_cal)
+            frequency_table_cal_df = create_relative_frequency_table(modelling_regions_cal_array, t1t2_deforestation, frequency_table_cal, frequency_map_cal,
+                                                                     benchmark_type=benchmark_type)
 
             # Step 4: Create the Fitting Density Map
             fitting_density_map_cal_name = build_filename(f"0{'7' if model_type == 'benchmark' else '4'}_{prefix}_Fitting_Density_Map_CAL.tif", project_name, version)
@@ -276,7 +288,8 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
             create_fit_density_map(risk30=vulnerability_cal,
                                    tabulation_bin_id_masked=modelling_regions_cal_array,
                                    merged_df=frequency_table_cal_df,
-                                   out_fn2=fitting_density_map_cal)
+                                   out_fn2=fitting_density_map_cal,
+                                   benchmark_type=benchmark_type)
             _check_cancel()
 
             print(f"Calibration Phase (CAL) - {model_name} COMPLETED")
@@ -299,7 +312,9 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
                         f"CNF phase requires CAL outputs. Frequency table not found: {frequency_table_cal}. "
                         f"Run CAL phase first or select it in this run."
                     )
-                frequency_table_cal_df = pd.read_excel(frequency_table_cal)
+                # A CAL table written by an earlier run may speak the other vocabulary; realign it
+                # so the prediction phase can index its columns by name.
+                frequency_table_cal_df = align_frequency_columns(pd.read_excel(frequency_table_cal), benchmark_type)
 
             # Also need NRT for benchmark CNF if CAL was not run
             if model_type == 'benchmark' and nrt is None:
@@ -324,7 +339,7 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
 
                 vulnerability_cnf_name = build_filename(f"01_{prefix}_Vulnerability_CNF.tif", project_name, version)
                 vulnerability_cnf = os.path.join(prediction_folder, vulnerability_cnf_name)
-                geometric_classification_alternative(alt_etp_cnf_image, n_classes, jnr_with_exclusions_mask, t2_forest, vulnerability_cnf)
+                kmeans_classification_alternative(alt_etp_cnf_image, n_classes, jnr_with_exclusions_mask, t2_forest, vulnerability_cnf)
 
             modelling_regions_cnf_name = build_filename(f"02_{prefix}_Modeling_Regions_CNF.tif", project_name, version)
             modelling_regions_cnf = os.path.join(prediction_folder, modelling_regions_cnf_name)
@@ -333,7 +348,8 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
             # Check for missing bins and update frequency table if needed
             frequency_table_cal_df = calculate_missing_bins_rf(frequency_table_cal_df,
                                                                 modelling_regions_cnf_array,
-                                                                frequency_table_cal)
+                                                                frequency_table_cal,
+                                                                benchmark_type=benchmark_type)
 
             # Step 2: Create the Prediction Density Map
             prediction_density_map_cnf_name = build_filename(f"03_{prefix}_Prediction_Density_Map_CNF.tif", project_name, version)
@@ -341,7 +357,8 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
             prediction_density_map_cnf_arr = create_fit_density_map(risk30=vulnerability_cnf,
                                                                     tabulation_bin_id_masked=modelling_regions_cnf_array,
                                                                     merged_df=frequency_table_cal_df,
-                                                                    out_fn2=prediction_density_map_cnf)
+                                                                    out_fn2=prediction_density_map_cnf,
+                                                                    benchmark_type=benchmark_type)
 
             # Step 3: Calculate Adjustment Ratio (AR) in CNF
             _check_cancel()
@@ -354,7 +371,8 @@ def run_testing_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_divisi
                                     adjusted_prediction_density_map_cnf,
                                     ar_log_cnf,
                                     deforestation_cnf=t2t3_deforestation,
-                                    max_iterations=max_iterations)
+                                    max_iterations=max_iterations,
+                                    benchmark_type=benchmark_type)
             _check_cancel()
 
             print(f"Confirmation Phase (CNF) - {model_name} COMPLETED")
@@ -388,7 +406,7 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
                           model_type='benchmark', alt_etp_hrp_image=None, alt_etp_vp_image=None,
                           project_name=None, version=None,
                           run_hrp=True, run_vp=True, vp_years=None,
-                          cancel_flag=None):
+                          cancel_flag=None, benchmark_type=BENCHMARK_DF):
     """
     Run the Application Stage for the Benchmark or Alternative Model.
 
@@ -415,9 +433,11 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
         run_hrp: Whether to run the Historical Reference Period (HRP) phase (default: True)
         run_vp: Whether to run the Validity Period (VP) phase (default: True)
         vp_years: Length of the Validity Period in years (required). The VP output will be
-                  converted to annual deforestation rate (ha/year per pixel) following VT0007
+                  converted to an annual rate (ha/year per pixel) following VT0007
                   methodology. Must be a positive integer > 0.
         cancel_flag: Optional callback function that returns True to cancel operation
+        benchmark_type: "deforestation" (default) or "degradation" — the output vocabulary
+            (frequency table columns, AR log). Nothing computed changes with it.
 
     Returns:
         dict: Dictionary containing key outputs and paths
@@ -477,7 +497,11 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
         print(f"NRT value read from Testing Stage: {nrt} meters")
 
     # Use a persistent temp directory for VT7 inputs
-    with tempfile.TemporaryDirectory() as vt7_temp_dir:
+    # ignore_cleanup_errors: this is where it bit. A dataset still open on one of
+    # these temp rasters -- the traceback of a raise keeps the frame, and the frame
+    # keeps the handle -- made the cleanup throw WinError 32 and buried the real
+    # exception under a nested "During handling of the above exception".
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as vt7_temp_dir:
         # Generate masked FCBM
         fcbm_masked = os.path.join(vt7_temp_dir, "fcbm_masked.tif")
         _generate_masked_fcbm(fcbm_file, jnr_with_exclusions_mask, fcbm_masked)
@@ -511,7 +535,7 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
 
                 vulnerability_hrp_name = build_filename(f"01_{prefix}_Vulnerability_HRP.tif", project_name, version)
                 vulnerability_hrp = os.path.join(fitting_folder, vulnerability_hrp_name)
-                geometric_classification_alternative(alt_etp_hrp_image, n_classes, jnr_with_exclusions_mask, t1_forest, vulnerability_hrp)
+                kmeans_classification_alternative(alt_etp_hrp_image, n_classes, jnr_with_exclusions_mask, t1_forest, vulnerability_hrp)
 
             # Step 2: Create the Modeling Regions Map
             modelling_regions_hrp_name = build_filename(f"02_{prefix}_Modeling_Regions_HRP.tif", project_name, version)
@@ -523,7 +547,8 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
             frequency_map_hrp = os.path.join(fitting_folder, frequency_map_hrp_name)
             frequency_table_hrp_name = build_filename(f"03_{prefix}_Relative_Frequency_Table_HRP.xlsx", project_name, version)
             frequency_table_hrp = os.path.join(fitting_folder, frequency_table_hrp_name)
-            frequency_table_hrp_df = create_relative_frequency_table(modelling_regions_hrp_array, hrp_deforestation, frequency_table_hrp, frequency_map_hrp)
+            frequency_table_hrp_df = create_relative_frequency_table(modelling_regions_hrp_array, hrp_deforestation, frequency_table_hrp, frequency_map_hrp,
+                                                                     benchmark_type=benchmark_type)
 
             # Step 4: Create the Fitting Density Map
             fitting_density_map_hrp_name = build_filename(f"04_{prefix}_Fitting_Density_Map_HRP.tif", project_name, version)
@@ -531,7 +556,8 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
             create_fit_density_map(risk30=vulnerability_hrp,
                                    tabulation_bin_id_masked=modelling_regions_hrp_array,
                                    merged_df=frequency_table_hrp_df,
-                                   out_fn2=fitting_density_map_hrp)
+                                   out_fn2=fitting_density_map_hrp,
+                                   benchmark_type=benchmark_type)
             _check_cancel()
 
             print(f"Historical Reference Period (HRP) - {model_name} COMPLETED")
@@ -554,7 +580,8 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
                         f"VP phase requires HRP outputs. Frequency table not found: {frequency_table_hrp}. "
                         f"Run HRP phase first or select it in this run."
                     )
-                frequency_table_hrp_df = pd.read_excel(frequency_table_hrp)
+                # As in CNF: an HRP table from an earlier run may name its columns the other way.
+                frequency_table_hrp_df = align_frequency_columns(pd.read_excel(frequency_table_hrp), benchmark_type)
 
             if model_type == 'benchmark':
                 # Generate T3 non-forest and distance
@@ -573,7 +600,7 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
 
                 vulnerability_vp_name = build_filename(f"01_{prefix}_Vulnerability_VP.tif", project_name, version)
                 vulnerability_vp = os.path.join(prediction_folder, vulnerability_vp_name)
-                geometric_classification_alternative(alt_etp_vp_image, n_classes, jnr_with_exclusions_mask, t3_forest, vulnerability_vp)
+                kmeans_classification_alternative(alt_etp_vp_image, n_classes, jnr_with_exclusions_mask, t3_forest, vulnerability_vp)
 
             modelling_regions_vp_name = build_filename(f"02_{prefix}_Modeling_Regions_VP.tif", project_name, version)
             modelling_regions_vp = os.path.join(prediction_folder, modelling_regions_vp_name)
@@ -582,7 +609,8 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
             # Check for missing bins and update frequency table if needed
             frequency_table_hrp_df = calculate_missing_bins_rf(frequency_table_hrp_df,
                                                                 modelling_regions_vp_array,
-                                                                frequency_table_hrp)
+                                                                frequency_table_hrp,
+                                                                benchmark_type=benchmark_type)
 
             # Step 2: Create the Prediction Density Map
             prediction_density_map_vp_name = build_filename(f"03_{prefix}_Prediction_Density_Map_VP.tif", project_name, version)
@@ -590,7 +618,8 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
             prediction_density_map_vp_arr = create_fit_density_map(risk30=vulnerability_vp,
                                                                    tabulation_bin_id_masked=modelling_regions_vp_array,
                                                                    merged_df=frequency_table_hrp_df,
-                                                                   out_fn2=prediction_density_map_vp)
+                                                                   out_fn2=prediction_density_map_vp,
+                                                                   benchmark_type=benchmark_type)
 
             # Step 3: Calculate Adjustment Ratio (AR) in VP
             _check_cancel()
@@ -604,7 +633,8 @@ def run_application_stage(folders, fcbm_file, jnr_with_exclusions_mask, admin_di
                                     ar_log_vp,
                                     max_iterations=max_iterations,
                                     expected_deforestation=expected_deforestation,
-                                    vp_years=vp_years)
+                                    vp_years=vp_years,
+                                    benchmark_type=benchmark_type)
             _check_cancel()
 
             print(f"Validity Period (VP) - {model_name} COMPLETED")

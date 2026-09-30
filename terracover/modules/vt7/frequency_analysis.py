@@ -17,9 +17,16 @@ VT7 Frequency Analysis and Tabulation
 
 This module contains functions for:
 - Tabulation of bin IDs with administrative divisions
-- Calculation of missing bins with relative frequency
+- Substitution of relative frequencies for modeling regions missing from the fitting phase
 - Creation of relative frequency tables
 - Creation of fit density maps
+
+A modeling region is a vulnerability zone crossed with an administrative division, so one can be
+missing from the fitting phase for two different reasons, and `calculate_missing_bins_rf` treats
+them differently: where the zone itself is present in other divisions the bin takes that zone's
+area-weighted average, and where the whole zone is absent its frequency is unknown and is
+interpolated along the vulnerability gradient. See that function for why a zero is not a
+conservative substitute.
 """
 
 import os
@@ -33,9 +40,11 @@ gdal.UseExceptions()
 
 try:
     from .utils import array_to_image, raster_calculator
+    from .terminology import BENCHMARK_DF, terms, frequency_columns, align_frequency_columns
 except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
     from terracover.modules.vt7.utils import array_to_image, raster_calculator
+    from terracover.modules.vt7.terminology import BENCHMARK_DF, terms, frequency_columns, align_frequency_columns
 
 
 def tabulation_bin_id(risk30, municipality, out_fn1):
@@ -83,6 +92,24 @@ def tabulation_bin_id(risk30, municipality, out_fn1):
     if nodata_municipality is not None:
         mask_arr_HRP = np.where(arr2 != nodata_municipality, mask_arr_HRP, 0)
 
+    # Guard the base-1000 modeling-region encoding. bin_id = risk*1000 + admin,
+    # decoded downstream as risk = bin_id // 1000 (lines ~187, ~190). That only holds while admin
+    # < 1000: with >= 1000 divisions the ids collide -- risk=1,admin=1002 and risk=2,admin=2 both
+    # become 2002 -- and two distinct modeling regions would silently merge, corrupting their
+    # deforestation totals. admin_divisions_to_raster assigns consecutive ids from 2, so a
+    # departmental jurisdiction (dozens of divisions) is far under the limit; a national one with
+    # >= 1000 divisions needs a wider multiplier here AND in the two // 1000 decoders. Fail clearly
+    # rather than merge regions in silence.
+    valid_admin = arr2[mask_arr_HRP == 1]
+    if valid_admin.size and int(valid_admin.max()) >= 1000:
+        raise ValueError(
+            f"frequency_analysis: administrative division id {int(valid_admin.max())} does not fit "
+            f"the base-1000 modeling-region encoding (vulnerability_class * 1000 + admin_id): ids "
+            f">= 1000 collide with a higher vulnerability class, merging distinct regions. This "
+            f"jurisdiction has too many divisions for the current encoding -- widen the multiplier "
+            f"here and in the two '// 1000' decoders."
+        )
+
     # Calculate tabulation bin id with mask using int64 arithmetic to prevent overflow
     # Formula: (vulnerability_class * 1000 + admin_division) * mask
     tabulation_bin_id_masked = (arr1 * 1000 + arr2) * mask_arr_HRP
@@ -105,26 +132,108 @@ def tabulation_bin_id(risk30, municipality, out_fn1):
     return tabulation_bin_id_masked
 
 # Handle Missing Bins in Prediction Phase
-def calculate_missing_bins_rf(fitting_frequency_df, prediction_modeling_regions_array, fitting_frequency_table_path):
+def _interpolate_absent_zones(fitting_df, absent_zones, average_col):
+    """Substituted relative frequency for vulnerability zones with no fitting data at all.
+
+    The zones are an ordered sequence — zone 1 least vulnerable, zone 30 most — and the relative
+    frequency rises along it, so the populated neighbours of an absent zone bound what it can
+    plausibly be. For each absent zone:
+
+    - Between two populated zones: linear interpolation on the zone index between the nearest
+      populated zone below and the nearest above.
+    - Below the lowest populated zone: that zone's frequency. It is the defensible upper bound —
+      a less vulnerable zone should not be allocated more than the least vulnerable one observed.
+    - Above the highest populated zone: symmetrically, that zone's frequency.
+
+    Returns a list of (zone, value, basis) so the caller can report each substitution.
+    """
+    zone_freq = (fitting_df.assign(_t=fitting_df['Area of the Bin(pixel)'] * fitting_df[average_col])
+                 .groupby('v_zone')
+                 .apply(lambda g: g['_t'].sum() / g['Area of the Bin(pixel)'].sum(),
+                        include_groups=False))
+    populated = sorted(zone_freq.index)
+    if not populated:
+        raise ValueError("The fitting frequency table holds no vulnerability zone at all; "
+                         "a substituted frequency cannot be derived from it.")
+
+    out = []
+    for zone in absent_zones:
+        below = [z for z in populated if z < zone]
+        above = [z for z in populated if z > zone]
+        if below and above:
+            lo, hi = below[-1], above[0]
+            f_lo, f_hi = float(zone_freq[lo]), float(zone_freq[hi])
+            w = (zone - lo) / (hi - lo)
+            value = f_lo + w * (f_hi - f_lo)
+            basis = f"interpolation between zones {lo} ({f_lo:.6f}) and {hi} ({f_hi:.6f})"
+        elif below:
+            lo = below[-1]
+            value = float(zone_freq[lo])
+            basis = f"the frequency of zone {lo}, the highest populated zone below it"
+        else:
+            hi = above[0]
+            value = float(zone_freq[hi])
+            basis = f"the frequency of zone {hi}, the lowest populated zone above it"
+        out.append((zone, value, basis))
+    return out
+
+
+def calculate_missing_bins_rf(fitting_frequency_df, prediction_modeling_regions_array, fitting_frequency_table_path,
+                              benchmark_type=BENCHMARK_DF):
     '''
-    If one or more empty bins are found in prediction phase, compute the jurisdiction-wide weighted average
-    of relative frequencies for missing bins and update the frequency table.
+    If one or more empty bins are found in prediction phase, compute the weighted average of
+    relative frequencies for missing bins and update the frequency table.
 
     This is applied when modeling regions exist in the Prediction phase but not in the Fitting phase.
+    A modeling region is a vulnerability zone crossed with an administrative division, so a region
+    can be missing for two quite different reasons, and the two are NOT treated alike:
 
-    When a vulnerability zone (v_zone) exists in the prediction phase but has no corresponding data
-    in the fitting phase (i.e., the entire v_zone is absent from the fitting frequency table),
-    the missing bins are assigned Average Deforestation = 0. This is appropriate because:
-    - These zones had no historical deforestation (hence absent from fitting phase)
-    - Lower vulnerability zones (e.g., v_zone=1) represent areas farthest from forest edges
-    - Assigning 0 is conservative and consistent with the lack of historical deforestation data
-    - The iterative AR adjustment will compensate by scaling other zones appropriately
+    1. The zone IS present in fitting, in other divisions. The bin takes the area-weighted average
+       of that zone — a pooled relative frequency, pooled at the level of the vulnerability zone.
+       The zone is the stratum the model attributes risk to; the division only subdivides it, so
+       falling back to the stratum uses the information the model considers relevant. This is the
+       normal case and the one that has actually occurred.
+
+    2. The zone is ABSENT from fitting altogether. The bin is currently assigned 0.
+
+    On case 2, note carefully what an absent zone does and does not mean. It does NOT mean the zone
+    had no change: a zone that existed with no change appears in the table with an average of 0.
+    Absence means the zone had no pixels at all — typically because the classification is recomputed
+    per phase and the forest geometry moved (e.g. v_zone=1 appears in VP but never existed in HRP as
+    forest area contracted). Its relative frequency is therefore UNKNOWN, not observed to be zero,
+    and 0 is a placeholder rather than a conservative estimate. Two consequences follow:
+
+    - The iterative AR adjustment cannot repair it. The adjustment is multiplicative, so a pixel at
+      0 stays at 0 however many iterations run; the AR reconciles the aggregate quantity but cannot
+      allocate any of it to those pixels.
+    - 0 is not neutral. It asserts no risk in a zone that may be more vulnerable than zones that
+      did receive an allocation.
+
+    Case 2 is therefore resolved by interpolating between the neighbouring populated zones, falling
+    back to the nearest populated zone at either end of the sequence: this preserves the monotonic
+    vulnerability gradient and yields a positive value the AR can scale. See
+    `_interpolate_absent_zones`. Every substitution is reported on stdout, with the basis used, so
+    that it can be recorded in the model documentation and cannot pass silently.
+
+    The reasoning and the measurements behind this rule are in
+    docs/VT7_Absent_Vulnerability_Zones_Interpolation.md.
+
+    Assigning 0 was the previous behaviour and is deliberately no longer reachable: it is not a
+    conservative estimate of an unknown frequency, and leaving it available as an option would
+    invite the same defect back into a later run.
 
     :param fitting_frequency_df: DataFrame with relative frequency table from fitting phase
     :param prediction_modeling_regions_array: Array of modeling region IDs from prediction phase
     :param fitting_frequency_table_path: Path to the fitting frequency table Excel file (will be backed up and updated)
+    :param benchmark_type: "deforestation" (default) or "degradation" — picks the column vocabulary
     :return: Updated frequency table DataFrame with missing bins filled
     '''
+    _t = terms(benchmark_type)
+    total_col, average_col = frequency_columns(benchmark_type)
+    # A fitting table written by the other benchmark (or before this flag existed) names its
+    # columns the other way; realign before indexing them by name.
+    fitting_frequency_df = align_frequency_columns(fitting_frequency_df, benchmark_type)
+
     # Get unique IDs from fitting phase and prediction phase
     fitting_ids = set(fitting_frequency_df['ID'].values)
     prediction_ids = set(np.unique(prediction_modeling_regions_array[prediction_modeling_regions_array != 0]))
@@ -155,21 +264,23 @@ def calculate_missing_bins_rf(fitting_frequency_df, prediction_modeling_regions_
     # Identify missing v_zones (v_zones in prediction but not in fitting)
     missing_v_zones_set = set(missing_v_zone) - fitting_v_zones
 
+    # Reported in full where the substitution happens, below; "(no historical change)" used to be
+    # claimed here, which is wrong — see the docstring on what an absent zone actually means.
     if missing_v_zones_set:
-        print(f"  Warning: {len(missing_v_zones_set)} vulnerability zone(s) have no data in fitting phase: {sorted(missing_v_zones_set)}")
-        print(f"  These zones will be assigned Average Deforestation = 0 (no historical deforestation)")
+        print(f"  {len(missing_v_zones_set)} vulnerability zone(s) absent from the fitting table: "
+              f"{sorted(missing_v_zones_set)}")
 
     # Select rows from the same vulnerability zones as missing bins
     filtered_df = df[df['v_zone'].isin(missing_v_zone)].copy()
 
-    # Calculate total deforestation for weighted average
-    filtered_df['Total Deforestation(pixel)'] = filtered_df['Area of the Bin(pixel)'] * filtered_df['Average Deforestation(pixel)']
+    # Calculate the total for the weighted average
+    filtered_df[total_col] = filtered_df['Area of the Bin(pixel)'] * filtered_df[average_col]
 
     # Group by vulnerability zone and sum area and weighted relative frequency
-    aggregated_df = filtered_df.groupby('v_zone')[['Total Deforestation(pixel)', 'Area of the Bin(pixel)']].sum().reset_index()
+    aggregated_df = filtered_df.groupby('v_zone')[[total_col, 'Area of the Bin(pixel)']].sum().reset_index()
 
-    # Calculate Average Deforestation for each vulnerability zone
-    aggregated_df['Average Deforestation(pixel)'] = aggregated_df['Total Deforestation(pixel)'] / aggregated_df['Area of the Bin(pixel)']
+    # Calculate the average for each vulnerability zone
+    aggregated_df[average_col] = aggregated_df[total_col] / aggregated_df['Area of the Bin(pixel)']
 
     # Create dataframe for missing IDs
     id_difference_df = pd.DataFrame(id_difference, columns=['ID'])
@@ -178,16 +289,32 @@ def calculate_missing_bins_rf(fitting_frequency_df, prediction_modeling_regions_
     # Create missing bins dataframe by merging with aggregated vulnerability zone data
     missing_bins_df = pd.merge(id_difference_df, aggregated_df, on='v_zone', how='left')
 
-    # Fill NaN values with 0 for v_zones that don't exist in fitting phase
-    # This handles the case where an entire vulnerability zone is absent from the fitting phase
-    # (e.g., v_zone=1 appears in VP but never existed in HRP due to forest area reduction)
-    nan_count = missing_bins_df['Average Deforestation(pixel)'].isna().sum()
+    # Case 2 of the docstring: the whole zone is absent from fitting, so the merge above found
+    # nothing and the average is NaN. The frequency is unknown, and the substitution rule is the
+    # frequency is unknown, and is substituted by interpolation along the vulnerability gradient.
+    nan_mask = missing_bins_df[average_col].isna()
+    nan_count = int(nan_mask.sum())
     if nan_count > 0:
-        missing_bins_df = missing_bins_df.fillna(0)
-        print(f"  Filled {nan_count} bins with 0 (v_zones absent from fitting phase)")
+        absent_zones = sorted(set(missing_bins_df.loc[nan_mask, 'v_zone']))
+        for zone, value, basis in _interpolate_absent_zones(df, absent_zones, average_col):
+            missing_bins_df.loc[missing_bins_df['v_zone'] == zone, average_col] = value
+            print(f"  Zone {zone} is absent from the fitting table: assigned "
+                  f"{average_col} = {value:.6f} by {basis}.")
+        # Area and total are genuinely unknown for an absent zone; only the average is substituted.
+        missing_bins_df[total_col] = missing_bins_df[total_col].fillna(0)
+        missing_bins_df['Area of the Bin(pixel)'] = (
+            missing_bins_df['Area of the Bin(pixel)'].fillna(0))
+        print(f"  Report these {nan_count} substituted bin(s) (zones {absent_zones}) and their "
+              f"area in the model documentation.")
+
+    # The ordinary case: the zone was present and the bin took its area-weighted average.
+    pooled_count = int(len(missing_bins_df) - nan_count)
+    if pooled_count > 0:
+        print(f"  {pooled_count} bin(s) took the pooled area-weighted average of their own "
+              f"vulnerability zone (the zone was present in fitting).")
 
     # Drop v_zone column from missing bins (keep only the needed columns)
-    missing_bins_df = missing_bins_df[['ID', 'Total Deforestation(pixel)', 'Area of the Bin(pixel)', 'Average Deforestation(pixel)']]
+    missing_bins_df = missing_bins_df[['ID', total_col, 'Area of the Bin(pixel)', average_col]]
 
     # Insert missing bins dataframe back to original dataframe
     df_new = pd.concat([df.drop('v_zone', axis=1), missing_bins_df], ignore_index=True)
@@ -210,7 +337,7 @@ def calculate_missing_bins_rf(fitting_frequency_df, prediction_modeling_regions_
 
         # Apply number formatting
         for row in range(2, len(df_new) + 2):
-            # Total Deforestation(pixel) - column 2
+            # Total <noun>(pixel) - column 2
             cell_b = worksheet.cell(row=row, column=2)
             if isinstance(cell_b.value, (int, float)):
                 cell_b.number_format = '#,##0'
@@ -220,31 +347,55 @@ def calculate_missing_bins_rf(fitting_frequency_df, prediction_modeling_regions_
             if isinstance(cell_c.value, (int, float)):
                 cell_c.number_format = '#,##0'
 
-            # Average Deforestation(pixel) - column 4
+            # Average <noun>(pixel) - column 4
             cell_d = worksheet.cell(row=row, column=4)
             if isinstance(cell_d.value, (int, float)):
                 cell_d.number_format = '0.00000'
+
+        # Embed provenance: a 'Parameters' sheet with the run arguments.
+        try:
+            from terracover.core.provenance import write_parameters_sheet
+            _wb = writer.book
+            if not any(s in _wb.sheetnames for s in ("Parameters", "Arguments")):
+                _params = [("module", "VT7 Frequency Analysis")] + [
+                    (k, v) for k, v in {
+                        "function": "calculate_missing_bins_rf",
+                        "benchmark_type": _t.benchmark_type,
+                        "fitting_frequency_table_path": str(fitting_frequency_table_path),
+                        "backup_path": str(backup_path),
+                        "num_missing_bins": int(len(id_difference)),
+                    }.items()
+                ]
+                write_parameters_sheet(_wb, _params)
+        except Exception:
+            pass
 
     print(f"Frequency table updated with {len(id_difference)} missing bins.")
 
     return df_new
 
 # Create Relative Frequency Table
-def create_relative_frequency_table(tabulation_bin_id_masked, deforestation_hrp, xlsx_name, map_output_path=None):
+def create_relative_frequency_table(tabulation_bin_id_masked, deforestation_hrp, xlsx_name, map_output_path=None,
+                                    benchmark_type=BENCHMARK_DF):
     """
     Create relative frequency table and optionally a raster map
-    :param tabulation_bin_id_masked: array with id and total deforestation
-    :param deforestation_hrp: Deforestation Map during the CAL/HRP (path to raster file)
+    :param tabulation_bin_id_masked: array with id and the total per bin
+    :param deforestation_hrp: change map during the CAL/HRP (path to raster file); the degradation
+                              map on an FCBM-DG run
     :param xlsx_name: output Excel file path
     :param map_output_path: optional path for output relative frequency raster map (default: None, no map created)
+    :param benchmark_type: "deforestation" (default) or "degradation" — picks the column vocabulary
     :return: merged_df: relative frequency dataframe
     """
     import tempfile
 
+    _t = terms(benchmark_type)
+    total_col, average_col = frequency_columns(benchmark_type)
+
     print("=" * 60)
     print("Creating Relative Frequency Table")
     print("=" * 60)
-    print(f"Analyzing deforestation within modeling regions...")
+    print(f"Analyzing {_t.lower} within modeling regions...")
 
     # Calculate array area of the bin [integer] (in pixels) for Col3 using np.unique and counts function, excluding 0
     unique, counts = np.unique(tabulation_bin_id_masked[tabulation_bin_id_masked != 0], return_counts=True)
@@ -273,14 +424,19 @@ def create_relative_frequency_table(tabulation_bin_id_masked, deforestation_hrp,
     arr_counts_deforestion = np.asarray((unique1, counts1)).T
 
     # Create pandas DataFrames
-    df1 = pd.DataFrame(arr_counts_deforestion, columns=['ID', 'Total Deforestation(pixel)'])
+    df1 = pd.DataFrame(arr_counts_deforestion, columns=['ID', total_col])
     df2 = pd.DataFrame(arr_counts, columns=['ID', 'Area of the Bin(pixel)'])
 
     # Merge the two DataFrames based on the 'id' column using an outer join to include all rows from both DataFrames
     merged_df = pd.merge(df1, df2, on='ID', how='outer').fillna(0)
 
-    # Calculate Average Deforestation by performing the division operation of col2 and col3 and add a new column to merged_df
-    merged_df['Average Deforestation(pixel)'] = merged_df.iloc[:, 1].astype(float) / merged_df.iloc[:, 2].astype(float)
+    # Calculate the average = total / Bin Area. A bin with 0 area (present in the change counts but
+    # not the bin counts after the outer join) has no average -> 0, instead of the inf that
+    # dividing by 0 would give.
+    _bin_area = merged_df.iloc[:, 2].astype(float)
+    merged_df[average_col] = (
+        merged_df.iloc[:, 1].astype(float) / _bin_area.replace(0, np.nan)
+    ).fillna(0.0)
 
     # Sort the DataFrame based on the 'ID'
     merged_df = merged_df.sort_values(by='ID')
@@ -311,7 +467,7 @@ def create_relative_frequency_table(tabulation_bin_id_masked, deforestation_hrp,
         for row in range(2, len(merged_df) + 2):  # Start from row 2 (skip header)
             # ID column - no formatting needed (integer)
 
-            # Total Deforestation(pixel) - column 2: comma separator, no decimals
+            # Total <noun>(pixel) - column 2: comma separator, no decimals
             cell_b = worksheet.cell(row=row, column=2)
             if isinstance(cell_b.value, (int, float)):
                 cell_b.number_format = '#,##0'
@@ -321,10 +477,30 @@ def create_relative_frequency_table(tabulation_bin_id_masked, deforestation_hrp,
             if isinstance(cell_c.value, (int, float)):
                 cell_c.number_format = '#,##0'
 
-            # Average Deforestation(pixel) - column 4: 5 decimals
+            # Average <noun>(pixel) - column 4: 5 decimals
             cell_d = worksheet.cell(row=row, column=4)
             if isinstance(cell_d.value, (int, float)):
                 cell_d.number_format = '0.00000'
+
+        # Embed provenance: a 'Parameters' sheet with the run arguments.
+        try:
+            from terracover.core.provenance import write_parameters_sheet
+            _wb = writer.book
+            if not any(s in _wb.sheetnames for s in ("Parameters", "Arguments")):
+                _params = [("module", "VT7 Frequency Analysis")] + [
+                    (k, v) for k, v in {
+                        "function": "create_relative_frequency_table",
+                        "benchmark_type": _t.benchmark_type,
+                        "deforestation_hrp": str(deforestation_hrp),
+                        "xlsx_name": str(xlsx_name),
+                        "excel_file_path": str(excel_file_path),
+                        "map_output_path": str(map_output_path) if map_output_path is not None else None,
+                        "num_regions": int(len(merged_df)),
+                    }.items()
+                ]
+                write_parameters_sheet(_wb, _params)
+        except Exception:
+            pass
 
     # Create relative frequency raster map if output path is provided
     if map_output_path is not None:
@@ -333,17 +509,18 @@ def create_relative_frequency_table(tabulation_bin_id_masked, deforestation_hrp,
         relative_frequency_map = tabulation_bin_id_masked.copy().astype(np.float32)
 
         # Insert index=0 row for background (ID=0)
-        new_row = pd.DataFrame({'ID': [0], 'Total Deforestation(pixel)': [0],
-                                'Area of the Bin(pixel)': [0], 'Average Deforestation(pixel)': [0]})
+        new_row = pd.DataFrame({'ID': [0], total_col: [0],
+                                'Area of the Bin(pixel)': [0], average_col: [0]})
         merged_df_with_zero = pd.concat([new_row, merged_df]).reset_index(drop=True)
 
         # Using numpy.searchsorted() to map IDs to relative frequency values
         df_sorted = merged_df_with_zero.sort_values('ID')
         sorted_indices = df_sorted['ID'].searchsorted(tabulation_bin_id_masked)
-        relative_frequency_map[:] = df_sorted['Average Deforestation(pixel)'].values[sorted_indices]
+        relative_frequency_map[:] = df_sorted[average_col].values[sorted_indices]
 
         # Save relative frequency map to temporary file, then apply mask
-        with tempfile.TemporaryDirectory() as temp_folder:
+        # ignore_cleanup_errors: a stray GDAL handle must not bury the real error.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_folder:
             temp_out = os.path.join(temp_folder, "temp_relative_frequency.tif")
             array_to_image(deforestation_hrp, temp_out, relative_frequency_map, gdal.GDT_Float32, -1)
 
@@ -360,24 +537,31 @@ def create_relative_frequency_table(tabulation_bin_id_masked, deforestation_hrp,
     return merged_df
 
 # Create the Fitting Density Map
-def create_fit_density_map(risk30, tabulation_bin_id_masked, merged_df, out_fn2=None):
+def create_fit_density_map(risk30, tabulation_bin_id_masked, merged_df, out_fn2=None,
+                           benchmark_type=BENCHMARK_DF):
     '''
     Create the fitting density map, this function used for fitting phase (CAL and HRP)
     :param risk30: the 30-class vulnerability map for the CAL/HRP
     :param tabulation_bin_id_masked: array for tabulation bin id in fitting Phase
     :param merged_df: relative frequency dataframe
     :param out_fn2: optional output file path
+    :param benchmark_type: "deforestation" (default) or "degradation" — picks the column vocabulary
     :return:
     '''
     import tempfile
+
+    total_col, average_col = frequency_columns(benchmark_type)
+    # Tolerate a table that speaks the other vocabulary (an older CAL/HRP run, or the other
+    # benchmark): the columns below are indexed by name.
+    merged_df = align_frequency_columns(merged_df, benchmark_type)
 
     print("=" * 60)
     print("Creating Fitting/Prediction Density Map")
     print("=" * 60)
 
     # Insert index=0 row into first row of merged_df DataFrame
-    new_row = pd.DataFrame({'ID': [0], 'Total Deforestation(pixel)': [0], 'Area of the Bin(pixel)': [0],
-                            'Average Deforestation(pixel)': [0]})
+    new_row = pd.DataFrame({'ID': [0], total_col: [0], 'Area of the Bin(pixel)': [0],
+                            average_col: [0]})
     merged_df = pd.concat([new_row, merged_df]).reset_index(drop=True)
 
     # Using numpy.searchsorted() to assign values to 'id'
@@ -387,8 +571,8 @@ def create_fit_density_map(risk30, tabulation_bin_id_masked, merged_df, out_fn2=
     # Clip indices to valid range to avoid out-of-bounds access
     sorted_indices = np.clip(sorted_indices, 0, len(df_sorted) - 1)
 
-    # Get the average deforestation values (float array, don't modify original tabulation_bin_id_masked)
-    relative_frequency_arr = df_sorted['Average Deforestation(pixel)'].values[sorted_indices].astype(np.float32)
+    # Get the average values (float array, don't modify original tabulation_bin_id_masked)
+    relative_frequency_arr = df_sorted[average_col].values[sorted_indices].astype(np.float32)
 
     # Calculate areal_resolution_of_map_pixels
     in_ds4 = gdal.Open(risk30)
@@ -402,7 +586,8 @@ def create_fit_density_map(risk30, tabulation_bin_id_masked, merged_df, out_fn2=
     # Create the final fit_density_map image using tabulation_bin_image function
     if out_fn2:
         print(f"Saving density map: {os.path.basename(out_fn2)}")
-        with tempfile.TemporaryDirectory() as temp_folder:
+        # ignore_cleanup_errors: a stray GDAL handle must not bury the real error.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_folder:
             temp_out = os.path.join(temp_folder, "temp_fit_density.tif")
             array_to_image(risk30, temp_out, fit_density_arr, gdal.GDT_Float32, -1)
 
