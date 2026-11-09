@@ -80,9 +80,9 @@ vt7/
   - Visualization and reporting
   - Plot generation for evaluation results (PNG plus an interactive HTML plot with per-cell
     hover, written when plotly is available)
-  - Per-cell statistics (MedAE, MAE) on values normalised to the nominal grid area, since the
-    exclusion mask leaves the cells unequal in area; aggregate statistics (Agreement,
-    Difference, IoU) on raw hectares, since they sum over cells rather than comparing them
+  - Every statistic (MedAE, MAE, Agreement, Difference, IoU) on the raw hectares of every
+    cell: the grid is kept intact, and an identified exclusion contributes neither predicted nor
+    observed deforestation to the cell that holds it
 
 **Functions**:
 - `evaluate_testing_stage()`: Evaluate testing stage model performance

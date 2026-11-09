@@ -21,16 +21,16 @@ Includes:
 - Voronoi-based sampling and evaluation
 - Statistical analysis and visualization (PNG, an interactive HTML plot, and a statistics file)
 
-Two things about the statistics are worth knowing before reading them:
+How the grid treats the identified exclusions (after Verra, 2026-11):
 
-- The assessment cells are left unequal in area by the exclusion mask, so observed and predicted
-  are normalised to the nominal grid area before any PER-CELL statistic is computed. Without that,
-  a cell trimmed to three quarters of full size holds proportionally less of everything, its
-  residual included, and pulls a median taken across cells. MedAE and MAE are therefore on the
-  normalised values; both are also reported raw, for traceability.
-- The AGGREGATE statistics — Agreement, Difference and IoU — are computed on the raw hectares.
-  They sum over all cells rather than comparing them, so they keep a physical reading, and
-  normalising them would overweight the cells the exclusions trimmed.
+- The grid is kept intact. Only the incomplete jurisdiction-edge cells are removed, tested on the
+  mask WITHOUT exclusions; a cell is neither split around an exclusion nor dropped for holding one.
+- An exclusion contributes neither predicted nor observed deforestation to the cell that holds it,
+  so every statistic is computed on the raw hectares of each cell: MedAE depends on the size and
+  geometry of the evaluation units, and scaling a trimmed cell up to the nominal grid area (done
+  until 2026-11) let the exclusion change that cell's error.
+- Every cell is a sample, a cell with no change on either side included: dropping it changes the
+  set of errors the median is taken from.
 """
 
 import os
@@ -640,8 +640,8 @@ class ModelEvaluation:
         :param ymax: maximum y-axis value
         :param benchmark_type: "deforestation" (default) or "degradation" — axis labels and the
                                statistics file wording; the regression, R² and MedAE are unchanged
-        :note: observed and predicted are normalised to the nominal grid area before any
-               statistic is computed — see the block below the X/Y extraction
+        :note: every statistic is on the raw hectares of every cell — see the module
+               docstring
         :return: None
         '''
         plt, sns = _plotting_backend()
@@ -654,14 +654,8 @@ class ModelEvaluation:
         # Set Seaborn Style
         sns.set_theme()
 
-        # Filter out cells where BOTH the actual and predicted values are zero or near-zero
-        # This prevents division by zero and improves regression quality
-        # Keep cells where at least one value is greater than a small threshold (0.01 ha)
-        threshold = 0.01
-        valid_mask = (clipped_gdf[actual_field] > threshold) | (clipped_gdf[predicted_field] > threshold)
-        clipped_gdf_filtered = clipped_gdf[valid_mask].copy()
-
-        # Check if we have enough data points BEFORE filtering
+        # Every cell is a sample, one with no change on either side included: dropping it
+        # would change the set of errors the median is taken from.
         if len(clipped_gdf) < 2:
             error_msg = (
                 f"\n{'='*80}\n"
@@ -704,41 +698,12 @@ class ModelEvaluation:
             # Return early without creating the regression plot
             return None
 
-        # Check if we have enough data points AFTER filtering
-        if len(clipped_gdf_filtered) < 2:
-            print(f"[WARNING] Only {len(clipped_gdf_filtered)} valid data points after filtering. Need at least 2 for regression.")
-            print(f"[WARNING] Total polygons: {len(clipped_gdf)}, Filtered out: {len(clipped_gdf) - len(clipped_gdf_filtered)}")
-            # Use original data if filtering removes too many points
-            clipped_gdf_filtered = clipped_gdf.copy()
-
-        # prepare the X/Y data
-        X = np.array(clipped_gdf_filtered[actual_field], dtype=np.float64)
-        Y = np.array(clipped_gdf_filtered[predicted_field], dtype=np.float64)
-
-        # --- Normalise to a common cell area -------------------------------------------
-        # Exclusions leave the assessment cells unequal in area, and an error in absolute
-        # hectares is then not comparable from one cell to another: a cell trimmed to 75 % of
-        # full size holds proportionally less of everything, residual included, and pulls the
-        # median accordingly. Both observed and predicted are therefore scaled to the nominal
-        # grid area before any statistic is taken, so every cell contributes on equal footing.
-        #
-        # A_ref is the NOMINAL grid area, not the largest observed cell: it is a constant of the
-        # method rather than a property of this particular sample, which keeps MedAE comparable
-        # between runs and between jurisdictions, and matches the denominator already used to
-        # express MedAE as a percentage.
-        area_ha = np.array(clipped_gdf_filtered['Area_ha'], dtype=np.float64)
-        if np.any(area_ha <= 0):
-            raise ValueError("create_plot: an assessment cell has zero or negative area; "
-                             "residuals cannot be normalised to a common basis.")
-        scale = float(grid_area) / area_ha
-        # Aggregate statistics (IoU, Agreement, Difference) are computed on these raw hectares:
-        # they sum over all cells rather than comparing them, so they keep a physical reading and
-        # normalising would overweight the cells the exclusions trimmed.
-        X_raw, Y_raw = X.copy(), Y.copy()
-        X = X * scale
-        Y = Y * scale
-        print(f"Residuals normalised to the nominal grid area ({float(grid_area):,.2f} ha); "
-              f"cell scaling factors {scale.min():.4f}–{scale.max():.4f}")
+        # prepare the X/Y data: the raw hectares of each cell. An exclusion contributes neither
+        # predicted nor observed deforestation to the cell that holds it, so the cell is not scaled
+        # to the nominal grid area (scaling it let the exclusion move its error).
+        X = np.array(clipped_gdf[actual_field], dtype=np.float64)
+        Y = np.array(clipped_gdf[predicted_field], dtype=np.float64)
+        area_ha = np.array(clipped_gdf['Area_ha'], dtype=np.float64)
 
         ## Perform linear regression
         slope, intercept, _, _, _ = stats.linregress(X, Y)
@@ -755,28 +720,22 @@ class ModelEvaluation:
         # Square the correlation coefficient
         r_squared = r ** 2
 
-        ## Per-cell error statistics, on the normalised values: each cell is one observation,
-        ## and cells of unequal area are only comparable once normalised.
+        ## Per-cell error statistics: each cell is one observation. The percentage is of the
+        ## nominal grid area, as in UDef-ARP.
         distance_arr = np.abs(X - Y)
         MedAE = float(np.median(distance_arr))
         MedAE_percent = (MedAE / int(grid_area)) * 100
         MAE = float(np.mean(distance_arr))
         MAE_percent = (MAE / int(grid_area)) * 100
 
-        # The same two statistics on the raw hectares, reported for traceability so the effect of
-        # the normalisation is visible rather than implicit.
-        raw_distance = np.abs(X_raw - Y_raw)
-        MedAE_raw = float(np.median(raw_distance))
-        MAE_raw = float(np.mean(raw_distance))
-
-        ## Aggregate agreement statistics, on the RAW hectares (see the note at the normalisation).
-        ## Agreement is the area both maps place change in; Difference the total absolute error;
-        ## IoU their ratio -- a measure of spatial overlap rather than of error size. A model can
-        ## have a good MedAE and a poor IoU if it gets the quantities right but the locations wrong.
-        agreement = float(np.minimum(X_raw, Y_raw).sum())
-        union = float(np.maximum(X_raw, Y_raw).sum())
+        ## Aggregate agreement statistics. Agreement is the area both maps place change in;
+        ## Difference the total absolute error; IoU their ratio -- a measure of spatial overlap
+        ## rather than of error size. A model can have a good MedAE and a poor IoU if it gets the
+        ## quantities right but the locations wrong.
+        agreement = float(np.minimum(X, Y).sum())
+        union = float(np.maximum(X, Y).sum())
         iou = 0.0 if union == 0 else agreement / union * 100
-        difference = float(raw_distance.sum())
+        difference = float(distance_arr.sum())
 
         # Set the figure size
         plt.figure(figsize=(8, 6))
@@ -785,10 +744,8 @@ class ModelEvaluation:
         plt.scatter(X, Y, color='steelblue', alpha=0.5, linewidth=1.0, s=50)
 
         # Add labels and title
-        plt.xlabel(f'Actual {_t.noun} (ha, normalised to grid area)', color='black',
-                   fontweight='bold', labelpad=10)
-        plt.ylabel(f'Predicted {_t.noun} (ha, normalised to grid area)', color='black',
-                   fontweight='bold', labelpad=10)
+        plt.xlabel(f'Actual {_t.noun} (ha)', color='black', fontweight='bold', labelpad=10)
+        plt.ylabel(f'Predicted {_t.noun} (ha)', color='black', fontweight='bold', labelpad=10)
         plt.title(title, color='firebrick', fontweight='bold', fontsize=20, pad=20)
 
         # Lines are drawn across the whole axis rather than only over the observed range, so that
@@ -889,18 +846,17 @@ class ModelEvaluation:
             import plotly.graph_objects as go
             import plotly.io as pio
 
-            ids = (np.asarray(clipped_gdf_filtered["ID"]) if "ID" in clipped_gdf_filtered
+            ids = (np.asarray(clipped_gdf["ID"]) if "ID" in clipped_gdf
                    else np.arange(1, len(X) + 1))
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=X, y=Y, mode="markers", name="Assessment cells", showlegend=False,
-                customdata=np.stack([ids, area_ha, X_raw, Y_raw, raw_distance], axis=-1),
+                customdata=np.stack([ids, area_ha, distance_arr], axis=-1),
                 hovertemplate=(
                     "Cell %{customdata[0]}<br>"
                     "Cell area: %{customdata[1]:,.0f} ha<br>"
-                    "<b>Normalised</b> observed %{x:,.2f} / predicted %{y:,.2f} ha<br>"
-                    "<b>Raw</b> observed %{customdata[2]:,.2f} / predicted %{customdata[3]:,.2f} ha"
-                    "<br>Raw absolute error: %{customdata[4]:,.2f} ha<extra></extra>"),
+                    "Observed %{x:,.2f} / predicted %{y:,.2f} ha<br>"
+                    "Absolute error: %{customdata[2]:,.2f} ha<extra></extra>"),
                 marker=dict(size=8, color="steelblue", opacity=0.6,
                             line=dict(width=0.5, color="white"))))
             for xs, ys, nm, col, dash in (
@@ -912,8 +868,8 @@ class ModelEvaluation:
             fig.update_layout(
                 title=dict(text=f"<b>{title}</b>", x=0.5, xanchor="center",
                            font=dict(color="firebrick", size=18)),
-                xaxis=dict(title=f"<b>Actual {_t.noun} (ha, normalised)</b>", range=[0, xmax]),
-                yaxis=dict(title=f"<b>Predicted {_t.noun} (ha, normalised)</b>", range=[0, ymax]),
+                xaxis=dict(title=f"<b>Actual {_t.noun} (ha)</b>", range=[0, xmax]),
+                yaxis=dict(title=f"<b>Predicted {_t.noun} (ha)</b>", range=[0, ymax]),
                 hovermode="closest", paper_bgcolor="white", plot_bgcolor="rgb(234,234,242)",
                 legend=dict(x=0.99, y=0.01, xanchor="right", yanchor="bottom"),
                 margin=dict(l=60, r=30, t=70, b=60))
@@ -937,9 +893,8 @@ class ModelEvaluation:
             f.write("=" * 60 + "\n\n")
             f.write(f"Title: {title}\n")
             f.write(f"Grid Area: {grid_area:,} ha\n")
-            f.write("Observed and predicted values are normalised to the nominal grid\n")
-            f.write("area (scaled by grid_area / cell_area), so that residuals are\n")
-            f.write("comparable across cells left unequal in area by the exclusions.\n\n")
+            f.write("Observed and predicted are the raw hectares of every cell: an\n")
+            f.write("identified exclusion contributes neither to the cell that holds it.\n\n")
 
             f.write("Regression Analysis\n")
             f.write("-" * 60 + "\n")
@@ -955,25 +910,18 @@ class ModelEvaluation:
 
             f.write("Spatial Agreement\n")
             f.write("-" * 60 + "\n")
-            f.write("Computed on raw hectares, not normalised: these aggregate over all\n")
-            f.write("cells rather than comparing them, so they keep a physical reading.\n")
             f.write(f"Agreement (area both maps agree on): {agreement:,.2f} ha\n")
             f.write(f"Difference (total absolute error):   {difference:,.2f} ha\n")
             f.write(f"IoU (Agreement / Union):             {iou:.2f} %\n\n")
 
-            f.write("Without normalisation, for traceability\n")
-            f.write("-" * 60 + "\n")
-            f.write(f"MedAE on raw hectares: {MedAE_raw:.2f} ha\n")
-            f.write(f"MAE on raw hectares:   {MAE_raw:.2f} ha\n\n")
-
             f.write("Data Range\n")
             f.write("-" * 60 + "\n")
-            f.write(f"Actual {_t.noun} (normalised):\n")
+            f.write(f"Actual {_t.noun}:\n")
             f.write(f"  Minimum:  {X.min():.2f} ha\n")
             f.write(f"  Maximum:  {X.max():.2f} ha\n")
             f.write(f"  Mean:     {X.mean():.2f} ha\n")
             f.write(f"  Std Dev:  {X.std():.2f} ha\n\n")
-            f.write(f"Predicted {_t.noun} (normalised):\n")
+            f.write(f"Predicted {_t.noun}:\n")
             f.write(f"  Minimum:  {Y.min():.2f} ha\n")
             f.write(f"  Maximum:  {Y.max():.2f} ha\n")
             f.write(f"  Mean:     {Y.mean():.2f} ha\n")

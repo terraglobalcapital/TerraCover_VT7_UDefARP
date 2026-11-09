@@ -27,7 +27,7 @@ Detailed technical documentation for every bug fix and enhancement — including
 | `VT7_Frequency_table_changes.md` | NoData handling + Int16 overflow in frequency tables |
 | `VT7_Evaluation_Improvements.md` | Dual-mask Thiessen evaluation + scatter-plot enhancements |
 | `VT7_Spatial_Deforestation_Allocation.md` | Spatial deforestation allocation |
-| `VT7_Evaluation_Statistics_and_Normalisation.md` | Residuals normalised to the nominal grid area; MAE / IoU / Agreement / Difference; interactive plot |
+| `VT7_Evaluation_Statistics_and_Normalisation.md` | Every statistic on the raw hectares of every cell of an intact grid (Verra, 2026-11; replaces the normalisation); MAE / IoU / Agreement / Difference; interactive plot |
 | `VT7_Vulnerability_Zoning_KMeans.md` | k-means zoning for alternative models, and why geometric intervals empty the extreme classes |
 | `VT7_Absent_Vulnerability_Zones_Interpolation.md` | Absent zones take an interpolated frequency instead of 0 |
 | `VT7_Evaluacion_Comparacion_2.11_vs_TerraCover.md` | Evaluation process: UDef-ARP 2.11 vs this package (Spanish) |
